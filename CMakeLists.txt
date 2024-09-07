@@ -56,25 +56,45 @@ endif()
 # Dependencies
 # ------------
 
-find_package(OpenSSL REQUIRED)
-find_package(unofficial-curlpp CONFIG REQUIRED)
-find_package(unofficial-inih CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
-find_package(pugixml CONFIG REQUIRED)
-find_package(ZLIB REQUIRED)
 
-list(APPEND MINIO_CPP_LIBS
-  unofficial::curlpp::curlpp
-  unofficial::inih::inireader
-  nlohmann_json::nlohmann_json
-  pugixml
-  OpenSSL::SSL OpenSSL::Crypto
-  ZLIB::ZLIB
-)
 
 if (WIN32)
+
+  find_package(OpenSSL REQUIRED)
+  find_package(unofficial-curlpp CONFIG REQUIRED)
+  find_package(unofficial-inih CONFIG REQUIRED)
+  find_package(nlohmann_json CONFIG REQUIRED)
+  find_package(pugixml CONFIG REQUIRED)
+  find_package(ZLIB REQUIRED)
+
+  list(APPEND MINIO_CPP_LIBS
+    unofficial::curlpp::curlpp
+    unofficial::inih::inireader
+    nlohmann_json::nlohmann_json
+    pugixml
+    OpenSSL::SSL OpenSSL::Crypto
+    ZLIB::ZLIB
+  )
+
   list(APPEND MINIO_CPP_LIBS wsock32)
   list(APPEND MINIO_CPP_LIBS ws2_32)
+else()
+  find_package(OpenSSL REQUIRED)
+  find_package(CURL REQUIRED)
+  find_package(nlohmann_json REQUIRED)
+  find_package(pugixml REQUIRED)
+  find_package(ZLIB REQUIRED)
+
+  list(APPEND MINIO_CPP_LIBS
+    curlpp
+    curl
+    inih
+    INIReader
+    nlohmann_json::nlohmann_json
+    pugixml
+    OpenSSL::SSL OpenSSL::Crypto
+    ZLIB::ZLIB
+  )
 endif()
 
 # Minio C++ Library
