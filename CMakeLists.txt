@@ -55,11 +55,8 @@ endif()
 
 # Dependencies
 # ------------
-
-
-
-if (WIN32)
-
+option(USE_VPKG "Use VPKG" ON)
+if (${USE_VPKG})
   find_package(OpenSSL REQUIRED)
   find_package(unofficial-curlpp CONFIG REQUIRED)
   find_package(unofficial-inih CONFIG REQUIRED)
@@ -75,9 +72,6 @@ if (WIN32)
     OpenSSL::SSL OpenSSL::Crypto
     ZLIB::ZLIB
   )
-
-  list(APPEND MINIO_CPP_LIBS wsock32)
-  list(APPEND MINIO_CPP_LIBS ws2_32)
 else()
   find_package(OpenSSL REQUIRED)
   find_package(CURL REQUIRED)
@@ -95,6 +89,11 @@ else()
     OpenSSL::SSL OpenSSL::Crypto
     ZLIB::ZLIB
   )
+endif()
+
+if (WIN32)
+  list(APPEND MINIO_CPP_LIBS wsock32)
+  list(APPEND MINIO_CPP_LIBS ws2_32)
 endif()
 
 # Minio C++ Library
@@ -153,6 +152,7 @@ add_library(miniocpp::miniocpp ALIAS miniocpp)
 # ---------------
 
 if (MINIO_CPP_TEST)
+  enable_testing()
   set(EXAMPLE_APPS
     MakeBucket
     RemoveBucket
@@ -212,6 +212,7 @@ if (MINIO_CPP_TEST)
     target_compile_features(${target} PUBLIC cxx_std_${MINIO_CPP_STD})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
     target_link_libraries(${target} PRIVATE miniocpp::miniocpp ${MINIO_CPP_LIBS})
+    add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
   endforeach()
 
   add_executable(tests tests/tests.cc)
