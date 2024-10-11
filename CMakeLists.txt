@@ -212,13 +212,13 @@ if (MINIO_CPP_TEST)
     target_compile_features(${target} PUBLIC cxx_std_${MINIO_CPP_STD})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
     target_link_libraries(${target} PRIVATE miniocpp::miniocpp ${MINIO_CPP_LIBS})
-    add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}>)
   endforeach()
 
   add_executable(tests tests/tests.cc)
   target_compile_features(tests PUBLIC cxx_std_${MINIO_CPP_STD})
   target_include_directories(tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
   target_link_libraries(tests miniocpp ${MINIO_CPP_LIBS})
+  add_test(NAME tests COMMAND $<TARGET_FILE:tests>)
 endif()
 
 # Minio C++ Documentation
