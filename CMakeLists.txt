@@ -44,27 +44,27 @@ set(MINIO_CPP_LIBS)
 set(MINIO_CPP_STD "17")
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC" OR "x${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "xMSVC")
-  # MSVC
+    # MSVC
 else()
-  # GCC/Clang/AppleClang/...
-  LIST(APPEND MINIO_CPP_CFLAGS -Wall -Wextra -Wconversion)
-  if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 8.0 AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0 AND NOT MINGW)
-    list(APPEND MINIO_CPP_LIBS stdc++fs)
-  endif()
+    # GCC/Clang/AppleClang/...
+    LIST(APPEND MINIO_CPP_CFLAGS -Wall -Wextra -Wconversion)
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 8.0 AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0 AND NOT MINGW)
+        list(APPEND MINIO_CPP_LIBS stdc++fs)
+    endif()
 endif()
 
 # Dependencies
 # ------------
-option(USE_VPKG "Use VPKG" ON)
+option(USE_VPKG "Use VPKG" OFF)
 if (${USE_VPKG})
-  find_package(OpenSSL REQUIRED)
-  find_package(unofficial-curlpp CONFIG REQUIRED)
-  find_package(unofficial-inih CONFIG REQUIRED)
-  find_package(nlohmann_json CONFIG REQUIRED)
-  find_package(pugixml CONFIG REQUIRED)
-  find_package(ZLIB REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    find_package(unofficial-curlpp CONFIG REQUIRED)
+    find_package(unofficial-inih CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
+    find_package(pugixml CONFIG REQUIRED)
+    find_package(ZLIB REQUIRED)
 
-  list(APPEND MINIO_CPP_LIBS
+    list(APPEND MINIO_CPP_LIBS
     unofficial::curlpp::curlpp
     unofficial::inih::inireader
     nlohmann_json::nlohmann_json
@@ -73,13 +73,42 @@ if (${USE_VPKG})
     ZLIB::ZLIB
   )
 else()
-  find_package(OpenSSL REQUIRED)
-  find_package(CURL REQUIRED)
-  find_package(nlohmann_json REQUIRED)
-  find_package(pugixml REQUIRED)
-  find_package(ZLIB REQUIRED)
+    include(FetchContent)
+    find_package(OpenSSL REQUIRED)
+    find_package(CURL REQUIRED)
+    find_package(nlohmann_json QUIET)
+    find_package(inih QUIET)
 
-  list(APPEND MINIO_CPP_LIBS
+    if(NOT inih_FOUND)
+
+        FetchContent_Declare(
+            inih
+            GIT_REPOSITORY https://github.com/benhoyt/inih.git
+            GIT_TAG        r58 # Use the latest stable release tag
+        )
+        FetchContent_MakeAvailable(inih)
+
+        if(TARGET INIReader)
+            install(TARGETS INIReader EXPORT miniocpp-targets)
+        endif()
+
+        if(TARGET inih)
+            install(TARGETS inih EXPORT miniocpp-targets)
+        endif()
+    endif()
+    if(NOT nlohmann_json_FOUND)
+        FetchContent_Declare(
+            nlohmann_json
+            GIT_REPOSITORY https://github.com/nlohmann/json.git
+            GIT_TAG        v3.11.3 # Use the version you need
+        )
+        FetchContent_MakeAvailable(nlohmann_json)
+        install(TARGETS nlohmann_json EXPORT miniocpp-targets)
+    endif()
+    find_package(pugixml REQUIRED)
+    find_package(ZLIB REQUIRED)
+
+    list(APPEND MINIO_CPP_LIBS
     curlpp
     curl
     inih
@@ -92,8 +121,8 @@ else()
 endif()
 
 if (WIN32)
-  list(APPEND MINIO_CPP_LIBS wsock32)
-  list(APPEND MINIO_CPP_LIBS ws2_32)
+    list(APPEND MINIO_CPP_LIBS wsock32)
+    list(APPEND MINIO_CPP_LIBS ws2_32)
 endif()
 
 # Minio C++ Library
@@ -152,8 +181,8 @@ add_library(miniocpp::miniocpp ALIAS miniocpp)
 # ---------------
 
 if (MINIO_CPP_TEST)
-  enable_testing()
-  set(EXAMPLE_APPS
+    enable_testing()
+    set(EXAMPLE_APPS
     MakeBucket
     RemoveBucket
     BucketExists
@@ -207,43 +236,43 @@ if (MINIO_CPP_TEST)
     GetObjectProgress
   )
 
-  foreach(target ${EXAMPLE_APPS})
-    add_executable(${target} examples/${target}.cc)
-    target_compile_features(${target} PUBLIC cxx_std_${MINIO_CPP_STD})
-    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
-    target_link_libraries(${target} PRIVATE miniocpp::miniocpp ${MINIO_CPP_LIBS})
-  endforeach()
+    foreach(target ${EXAMPLE_APPS})
+        add_executable(${target} examples/${target}.cc)
+        target_compile_features(${target} PUBLIC cxx_std_${MINIO_CPP_STD})
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+        target_link_libraries(${target} PRIVATE miniocpp::miniocpp ${MINIO_CPP_LIBS})
+    endforeach()
 
-  add_executable(tests tests/tests.cc)
-  target_compile_features(tests PUBLIC cxx_std_${MINIO_CPP_STD})
-  target_include_directories(tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
-  target_link_libraries(tests miniocpp ${MINIO_CPP_LIBS})
-  add_test(NAME tests COMMAND $<TARGET_FILE:tests>)
+    add_executable(tests tests/tests.cc)
+    target_compile_features(tests PUBLIC cxx_std_${MINIO_CPP_STD})
+    target_include_directories(tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+    target_link_libraries(tests miniocpp ${MINIO_CPP_LIBS})
+    add_test(NAME tests COMMAND $<TARGET_FILE:tests>)
 endif()
 
 # Minio C++ Documentation
 # -----------------------
 
 if (MINIO_CPP_MAKE_DOC)
-  # check if Doxygen is installed
-  find_package(Doxygen)
-  if (DOXYGEN_FOUND)
-    # set input and output files
-    set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/Doxyfile.in)
-    set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
+    # check if Doxygen is installed
+    find_package(Doxygen)
+    if (DOXYGEN_FOUND)
+        # set input and output files
+        set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/Doxyfile.in)
+        set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
 
-    # request to configure the file
-    configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
+        # request to configure the file
+        configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
 
-    # note the option ALL which allows to build the docs together with the application
-    add_custom_target(doc_doxygen ALL
+        # note the option ALL which allows to build the docs together with the application
+        add_custom_target(doc_doxygen ALL
       COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_OUT}
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       COMMENT "Generating API documentation with Doxygen"
       VERBATIM )
-  else()
-    message("Doxygen need to be installed to generate the doxygen documentation")
-  endif()
+    else()
+        message("Doxygen need to be installed to generate the doxygen documentation")
+    endif()
 endif()
 
 # Installation Instructions
