@@ -85,18 +85,17 @@ utils::Multimap ObjectWriteArgs::Headers() const {
 }
 
 utils::Multimap ObjectConditionalReadArgs::Headers() const {
-  size_t* off = offset;
-  size_t* len = length;
+  std::optional<size_t> off = offset;
+  std::optional<size_t> len = length;
 
-  size_t zero = 0;
-  if (len != nullptr && off == nullptr) {
-    off = &zero;
+  if (len.has_value() && !off.has_value()) {
+    off = 0;
   }
 
   std::string range;
-  if (off != nullptr) {
+  if (off.has_value()) {
     range = "bytes=" + std::to_string(*off) + "-";
-    if (len != nullptr) {
+    if (len.has_value()) {
       range += std::to_string(*off + *len - 1);
     }
   }
@@ -228,8 +227,13 @@ error::Error GetObjectArgs::Validate() const {
   if (error::Error err = ObjectConditionalReadArgs::Validate()) {
     return err;
   }
-  if (datafunc == nullptr) {
-    return error::Error("data callback must be set");
+  const bool has_datafunc = (datafunc != nullptr);
+  const bool has_buf = (buf != nullptr);
+  if (has_datafunc == has_buf) {
+    return error::Error("exactly one of datafunc or buf must be set");
+  }
+  if (has_buf && !size.has_value()) {
+    return error::Error("size must be set when buf is set");
   }
 
   return error::SUCCESS;
@@ -294,15 +298,30 @@ ListObjectVersionsArgs& ListObjectVersionsArgs::operator=(
   return this->operator=(ListObjectVersionsArgs(args));
 }
 
-PutObjectArgs::PutObjectArgs(std::istream& istream, long object_size,
-                             long part_size)
-    : stream(istream) {
+PutObjectArgs::PutObjectArgs(std::istream& istream,
+                             std::optional<uint64_t> object_size,
+                             size_t part_size)
+    : stream(&istream) {
   this->object_size = object_size;
   this->part_size = part_size;
 }
 
 error::Error PutObjectArgs::Validate() {
   if (error::Error err = ObjectArgs::Validate()) return err;
+  const bool has_stream = (stream != nullptr);
+  const bool has_buf = (buf != nullptr);
+  if (has_stream == has_buf) {
+    return error::Error("exactly one of stream or buf must be set");
+  }
+  if (has_buf) {
+    if (!size.has_value()) {
+      return error::Error("size must be set when buf is set");
+    }
+    if (!object_size.has_value()) object_size = static_cast<uint64_t>(*size);
+  }
+  if (max_inflight_parts.has_value() && *max_inflight_parts == 0) {
+    return error::Error("max_inflight_parts must be greater than 0");
+  }
   return utils::CalcPartInfo(object_size, part_size, part_count);
 }
 
@@ -313,7 +332,7 @@ error::Error CopyObjectArgs::Validate() const {
   if (error::Error err = source.Validate()) {
     return err;
   }
-  if (source.offset != nullptr || source.length != nullptr) {
+  if (source.offset.has_value() || source.length.has_value()) {
     if (metadata_directive != nullptr &&
         *metadata_directive == Directive::kCopy) {
       return error::Error(
@@ -340,13 +359,13 @@ error::Error ComposeSource::BuildHeaders(size_t object_size,
   }
   msg += ": ";
 
-  if (offset != nullptr && *offset >= object_size) {
+  if (offset.has_value() && *offset >= object_size) {
     return error::Error(msg + "offset " + std::to_string(*offset) +
                         " is beyond object size " +
                         std::to_string(object_size));
   }
 
-  if (length != nullptr) {
+  if (length.has_value()) {
     if (*length > object_size) {
       return error::Error(msg + "length " + std::to_string(*length) +
                           " is beyond object size " +
@@ -354,8 +373,8 @@ error::Error ComposeSource::BuildHeaders(size_t object_size,
     }
 
     size_t off = 0;
-    if (offset != nullptr) off = *offset;
-    if ((off + *length) > object_size) {
+    if (offset.has_value()) off = *offset;
+    if (length.has_value() && (off + *length) > object_size) {
       return error::Error(
           msg + "compose size " + std::to_string(off + *length) +
           " is beyond object size " + std::to_string(object_size));
@@ -424,8 +443,7 @@ error::Error UploadObjectArgs::Validate() {
   }
 
   std::filesystem::path file_path = filename;
-  size_t obj_size = std::filesystem::file_size(file_path);
-  object_size = static_cast<long>(obj_size);
+  object_size = static_cast<uint64_t>(std::filesystem::file_size(file_path));
   return utils::CalcPartInfo(object_size, part_size, part_count);
 }
 
@@ -448,8 +466,8 @@ error::Error SelectObjectContentArgs::Validate() const {
     return error::Error("SQL expression must not be empty");
   }
 
-  if (!((request.csv_input != nullptr) ^ (request.json_input != nullptr) ^
-        (request.parquet_input != nullptr))) {
+  if (((request.csv_input != nullptr) + (request.json_input != nullptr) +
+       (request.parquet_input != nullptr)) != 1) {
     return error::Error(
         "One of CSV, JSON or Parquet input serialization must be set");
   }

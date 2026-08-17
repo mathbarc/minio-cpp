@@ -1,9 +1,12 @@
 #!/bin/sh
 
-BUILD_OPTIONS="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+set -x
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_OPTIONS="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_SHARED_LIBS=ON"
 
 if [ -n "$VCPKG_ROOT" ]; then
-  BUILD_OPTIONS="${BUILD_OPTIONS} -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+	BUILD_OPTIONS="${BUILD_OPTIONS} -DVCPKG_ROOT=${VCPKG_ROOT}"
 fi
 
 echo "== [Configuring Build - Debug] =="

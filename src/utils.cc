@@ -17,11 +17,18 @@
 
 #include "miniocpp/utils.h"
 
+#include <charconv>
+#include <optional>
+
 #include "miniocpp/error.h"
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
 #include <corecrt.h>
+#endif
+
+#ifndef _MSC_VER
+#include <unistd.h>
 #endif
 
 #include <openssl/bio.h>
@@ -34,10 +41,12 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <clocale>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -52,6 +61,7 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <pugixml.hpp>
 #include <regex>
 #include <sstream>
 #include <streambuf>
@@ -218,6 +228,14 @@ std::string EncodePath(const std::string& path) {
   return out;
 }
 
+std::string XMLEncode(const std::string& value) {
+  pugi::xml_document doc;
+  doc.append_child(pugi::node_pcdata).set_value(value.c_str());
+  std::ostringstream out;
+  doc.print(out);
+  return out.str();
+}
+
 std::string Sha256Hash(std::string_view str) {
   EVP_MD_CTX* ctx = EVP_MD_CTX_create();
   if (ctx == nullptr) {
@@ -251,10 +269,15 @@ std::string Sha256Hash(std::string_view str) {
   EVP_MD_CTX_destroy(ctx);
 
   std::string hash;
-  char buf[3];
+  hash.resize(length * 2);
+  char* out = hash.data();
   for (unsigned int i = 0; i < length; ++i) {
-    snprintf(buf, 3, "%02x", digest[i]);
-    hash += buf;
+    if (auto [ptr, ec] = std::to_chars(out, out + 2, digest[i], 16);
+        ptr - out == 1) {
+      out[1] = out[0];
+      out[0] = '0';
+    }
+    out += 2;
   }
 
   OPENSSL_free(digest);
@@ -315,6 +338,49 @@ std::string Md5sumHash(std::string_view str) {
   OPENSSL_free(digest);
 
   return Base64Encode(hash);
+}
+
+namespace {
+
+// NVMe CRC64 reflected lookup table for polynomial 0xad93d23594c93659.
+// Built lazily once; thread-safe via the C++11 static-init guarantee.
+const std::array<uint64_t, 256>& Crc64NvmeTable() {
+  static const std::array<uint64_t, 256> kTable = []() {
+    constexpr uint64_t kPoly = 0x9a6c9329ac4bc9b5ULL;  // reflected polynomial
+    std::array<uint64_t, 256> table{};
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint64_t crc = static_cast<uint64_t>(i);
+      for (int j = 0; j < 8; ++j) {
+        crc = (crc & 1ULL) ? (crc >> 1) ^ kPoly : (crc >> 1);
+      }
+      table[i] = crc;
+    }
+    return table;
+  }();
+  return kTable;
+}
+
+}  // namespace
+
+uint64_t Crc64Nvme(const char* data, size_t len) {
+  const auto& table = Crc64NvmeTable();
+  uint64_t crc = 0xffffffffffffffffULL;
+  const auto* p = reinterpret_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < len; ++i) {
+    crc = table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+  }
+  return crc ^ 0xffffffffffffffffULL;
+}
+
+std::string Crc64NvmeBase64(const char* data, size_t len) {
+  const uint64_t crc = Crc64Nvme(data, len);
+  // S3 expects big-endian bytes of the CRC value, base64-encoded.
+  unsigned char be[8];
+  for (int i = 0; i < 8; ++i) {
+    be[i] = static_cast<unsigned char>((crc >> (56 - i * 8)) & 0xff);
+  }
+  return Base64Encode(
+      std::string_view(reinterpret_cast<const char*>(be), sizeof(be)));
 }
 
 std::string FormatTime(const std::tm& time, const char* format) {
@@ -468,18 +534,6 @@ std::list<std::string> Multimap::ToHttpHeaders() const {
   return headers;
 }
 
-std::string Multimap::ToQueryString() const {
-  std::string query_string;
-  for (auto& [key, values] : map_) {
-    for (auto& value : values) {
-      std::string s = curlpp::escape(key) + "=" + curlpp::escape(value);
-      if (!query_string.empty()) query_string += "&";
-      query_string += s;
-    }
-  }
-  return query_string;
-}
-
 bool Multimap::Contains(std::string_view key) const {
   return keys_.find(ToLower(std::string(key))) != keys_.end();
 }
@@ -508,58 +562,62 @@ std::list<std::string> Multimap::Keys() const {
   return keys;
 }
 
+std::string removeExtraSpaces(const std::string& s) {
+  std::string result;
+  result.reserve(s.size());
+  bool inSpace = false;
+
+  for (char c : s) {
+    if (c != ' ') {
+      if (inSpace && !result.empty()) result += ' ';
+      result += c;
+      inSpace = false;
+    } else {
+      inSpace = true;
+    }
+  }
+  return result;
+}
+
 void Multimap::GetCanonicalHeaders(std::string& signed_headers,
                                    std::string& canonical_headers) const {
-  std::vector<std::string> signed_headerslist;
-  std::map<std::string, std::string> map;
-
   for (const auto& [k, values] : map_) {
     std::string key = ToLower(k);
     if ("authorization" == key || "user-agent" == key) continue;
-    if (std::find(signed_headerslist.begin(), signed_headerslist.end(), key) ==
-        signed_headerslist.end()) {
-      signed_headerslist.push_back(key);
+    if (!signed_headers.empty()) {
+      signed_headers += ";";
+      canonical_headers += "\n";
     }
+    signed_headers += key;
 
     std::string value;
     for (const auto& v : values) {
       if (!value.empty()) value += ",";
-      value += utils::Trim(std::regex_replace(v, MULTI_SPACE_REGEX, " "));
+      value += removeExtraSpaces(v);
     }
-
-    map[key] = value;
+    canonical_headers += key;
+    canonical_headers += ":";
+    canonical_headers += value;
   }
-
-  std::sort(signed_headerslist.begin(), signed_headerslist.end());
-  signed_headers = utils::Join(signed_headerslist, ";");
-
-  std::vector<std::string> canonical_headerslist;
-  for (auto& [key, value] : map) {
-    canonical_headerslist.push_back(key + ":" + value);
-  }
-
-  std::sort(canonical_headerslist.begin(), canonical_headerslist.end());
-  canonical_headers = utils::Join(canonical_headerslist, "\n");
 }
 
 std::string Multimap::GetCanonicalQueryString() const {
-  std::vector<std::string> keys;
-  for (auto& [key, _] : map_) {
-    keys.push_back(key);
-  }
+  std::string query_string;
+  query_string.reserve(map_.size() * 30);
 
-  std::sort(keys.begin(), keys.end());
-  std::vector<std::string> values;
-
-  for (auto& key : keys) {
-    if (const auto i = map_.find(key); i != map_.cend()) {
-      for (auto& value : i->second) {
-        values.push_back(curlpp::escape(key) + "=" + curlpp::escape(value));
-      }
+  for (auto& [key, values] : map_) {
+    for (auto& value : values) {
+      if (!query_string.empty()) query_string += "&";
+      query_string += curlpp::escape(key);
+      query_string += '=';
+      query_string += curlpp::escape(value);
     }
   }
+  return query_string;
+}
 
-  return utils::Join(values, "&");
+std::string Multimap::ToQueryString() const {
+  return this->GetCanonicalQueryString();
 }
 
 error::Error CheckBucketName(std::string_view bucket_name, bool strict) {
@@ -605,8 +663,9 @@ error::Error ReadPart(std::istream& stream, char* buf, size_t size,
   return error::SUCCESS;
 }
 
-error::Error CalcPartInfo(long object_size, size_t& part_size,
-                          long& part_count) {
+error::Error CalcPartInfo(std::optional<uint64_t> object_size,
+                          size_t& part_size,
+                          std::optional<size_t>& part_count) {
   if (part_size > 0) {
     if (part_size < kMinPartSize) {
       return error::Error("part size " + std::to_string(part_size) +
@@ -619,9 +678,9 @@ error::Error CalcPartInfo(long object_size, size_t& part_size,
     }
   }
 
-  if (object_size >= 0) {
-    if (static_cast<uint64_t>(object_size) > kMaxObjectSize) {
-      return error::Error("object size " + std::to_string(object_size) +
+  if (object_size.has_value()) {
+    if (*object_size > kMaxObjectSize) {
+      return error::Error("object size " + std::to_string(*object_size) +
                           " is not supported; maximum allowed 5TiB");
     }
   } else if (part_size <= 0) {
@@ -629,23 +688,23 @@ error::Error CalcPartInfo(long object_size, size_t& part_size,
         "valid part size must be provided when object size is unknown");
   }
 
-  if (object_size < 0) {
-    part_count = -1;
+  if (!object_size.has_value()) {
+    part_count.reset();
     return error::SUCCESS;
   }
 
   if (part_size <= 0) {
-    // Calculate part size by multiple of kMinPartSize.
-    double psize = std::ceil((double)object_size / kMaxMultipartCount);
+    // Calculate part size by multiple of kOptPartSize.
+    double psize = std::ceil((double)*object_size / kMaxMultipartCount);
     part_size = (size_t)std::ceil(psize / kMinPartSize) * kMinPartSize;
   }
 
-  if (static_cast<long>(part_size) > object_size) part_size = object_size;
-  part_count = static_cast<long>(
-      (part_size > 0) ? ((object_size + part_size - 1) / part_size) : 1);
-  if (part_count > kMaxMultipartCount) {
+  if (part_size > *object_size) part_size = *object_size;
+  part_count = static_cast<size_t>(
+      (part_size > 0) ? ((*object_size + part_size - 1) / part_size) : 1);
+  if (*part_count > kMaxMultipartCount) {
     return error::Error(
-        "object size " + std::to_string(object_size) + " and part size " +
+        "object size " + std::to_string(*object_size) + " and part size " +
         std::to_string(part_size) + " make more than " +
         std::to_string(kMaxMultipartCount) + "parts for upload");
   }

@@ -23,6 +23,7 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <ostream>
 #include <string>
@@ -191,11 +192,11 @@ constexpr const char* QuoteFieldsToString(QuoteFields qtype) noexcept {
 }
 
 struct CsvInputSerialization {
-  CompressionType* compression_type = nullptr;
+  std::shared_ptr<CompressionType> compression_type;
   bool allow_quoted_record_delimiter = false;
   char comments = 0;
   char field_delimiter = 0;
-  FileHeaderInfo* file_header_info = nullptr;
+  std::shared_ptr<FileHeaderInfo> file_header_info;
   char quote_character = 0;
   char quote_escape_character = 0;
   char record_delimiter = 0;
@@ -205,8 +206,8 @@ struct CsvInputSerialization {
 };  // struct CsvInputSerialization
 
 struct JsonInputSerialization {
-  CompressionType* compression_type = nullptr;
-  JsonType* json_type = nullptr;
+  std::shared_ptr<CompressionType> compression_type;
+  std::shared_ptr<JsonType> json_type;
 
   JsonInputSerialization() = default;
   ~JsonInputSerialization() = default;
@@ -221,7 +222,7 @@ struct CsvOutputSerialization {
   char field_delimiter = 0;
   char quote_character = 0;
   char quote_escape_character = 0;
-  QuoteFields* quote_fields = nullptr;
+  std::shared_ptr<QuoteFields> quote_fields;
   char record_delimiter = 0;
 
   CsvOutputSerialization() = default;
@@ -329,10 +330,16 @@ struct Part {
   std::string etag;
   utils::UtcTime last_modified = {};
   size_t size = 0;
+  std::string checksum_crc64nvme;
 
   Part() = default;
   explicit Part(unsigned int number, std::string etag)
       : number(number), etag(std::move(etag)) {}
+  explicit Part(unsigned int number, std::string etag,
+                std::string checksum_crc64nvme)
+      : number(number),
+        etag(std::move(etag)),
+        checksum_crc64nvme(std::move(checksum_crc64nvme)) {}
   ~Part() = default;
 };  // struct Part
 
@@ -349,6 +356,8 @@ struct DeleteObject {
   std::string version_id = {};
 
   DeleteObject() = default;
+  explicit DeleteObject(std::string object_name)
+      : name(std::move(object_name)) {}
   ~DeleteObject() = default;
 };  // struct DeleteObject
 

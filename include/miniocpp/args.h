@@ -21,11 +21,15 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <optional>
 #include <string>
 #include <type_traits>
 
 #include "error.h"
 #include "http.h"
+#ifdef MINIO_CPP_RDMA
+#include "rdma_client.h"
+#endif
 #include "sse.h"
 #include "types.h"
 #include "utils.h"
@@ -88,8 +92,8 @@ struct ObjectReadArgs : public ObjectVersionArgs {
 };  // struct ObjectReadArgs
 
 struct ObjectConditionalReadArgs : public ObjectReadArgs {
-  size_t* offset = nullptr;
-  size_t* length = nullptr;
+  std::optional<size_t> offset;
+  std::optional<size_t> length;
   std::string match_etag;
   std::string not_match_etag;
   utils::UtcTime modified_since;
@@ -144,9 +148,9 @@ struct CreateMultipartUploadArgs : public ObjectArgs {
 };  // struct CreateMultipartUploadArgs
 
 struct PutObjectBaseArgs : public ObjectWriteArgs {
-  long object_size = -1;
+  std::optional<uint64_t> object_size;
   size_t part_size = 0;
-  long part_count = 0;
+  std::optional<size_t> part_count;
   std::string content_type;
 
   PutObjectBaseArgs() = default;
@@ -155,9 +159,15 @@ struct PutObjectBaseArgs : public ObjectWriteArgs {
 
 struct PutObjectApiArgs : public PutObjectBaseArgs {
   std::string_view data;
+  char* buf;
+  size_t size;
   utils::Multimap query_params;
   http::ProgressFunction progressfunc = nullptr;
   void* progress_userdata = nullptr;
+#ifdef MINIO_CPP_RDMA
+  minio::rdma::Client* rdmaclient = nullptr;
+#endif
+  std::string checksum_crc64nvme;  // CRC64NVME checksum for multipart uploads
 
   PutObjectApiArgs() = default;
   ~PutObjectApiArgs() = default;
@@ -166,9 +176,15 @@ struct PutObjectApiArgs : public PutObjectBaseArgs {
 struct UploadPartArgs : public ObjectWriteArgs {
   std::string upload_id;
   unsigned int part_number;
+  char* buf;
+  size_t part_size;
   std::string_view data;
   http::ProgressFunction progressfunc = nullptr;
   void* progress_userdata = nullptr;
+#ifdef MINIO_CPP_RDMA
+  minio::rdma::Client* rdmaclient = nullptr;
+#endif
+  std::string checksum_crc64nvme;  // CRC64NVME checksum for multipart uploads
 
   UploadPartArgs() = default;
   ~UploadPartArgs() = default;
@@ -204,8 +220,13 @@ struct DownloadObjectArgs : public ObjectReadArgs {
 };  // struct DownloadObjectArgs
 
 struct GetObjectArgs : public ObjectConditionalReadArgs {
+  // Exactly one of (datafunc, buf) must be set; Validate() enforces.
+  // When buf is set, the call attempts RDMA and falls back to streaming
+  // the HTTP body into the same buffer on RDMA decline.
   http::DataFunction datafunc;
   void* userdata = nullptr;
+  char* buf = nullptr;
+  std::optional<size_t> size;
   http::ProgressFunction progressfunc = nullptr;
   void* progress_userdata = nullptr;
 
@@ -313,11 +334,27 @@ struct ListObjectVersionsArgs : public ListObjectsCommonArgs {
 };  // struct ListObjectVersionsArgs
 
 struct PutObjectArgs : public PutObjectBaseArgs {
-  std::istream& stream;
+  // Exactly one of (stream, buf) must be set; Validate() enforces.
+  // When buf is set, the call attempts RDMA and falls back to a
+  // streaming HTTP upload from the same buffer on RDMA decline.
+  //
+  // For async callers (PutObjectAsync): *stream must outlive the
+  // returned std::future, exactly as it must for sync PutObject.
+  std::istream* stream = nullptr;
+  char* buf = nullptr;
+  std::optional<size_t> size;
   http::ProgressFunction progressfunc = nullptr;
   void* progress_userdata = nullptr;
+#ifdef MINIO_CPP_RDMA
+  minio::rdma::Client* rdmaclient = nullptr;
+#endif
+  std::string checksum_crc64nvme;  // CRC64NVME checksum for multipart uploads
+  std::optional<unsigned int>
+      max_inflight_parts;  // Max concurrent UploadPart calls
 
-  PutObjectArgs(std::istream& stream, long object_size, long part_size);
+  PutObjectArgs() = default;
+  PutObjectArgs(std::istream& stream, std::optional<uint64_t> object_size,
+                size_t part_size);
   ~PutObjectArgs() = default;
 
   error::Error Validate();
@@ -391,7 +428,7 @@ struct RemoveObjectsArgs : public BucketArgs {
 };  // struct RemoveObjectsArgs
 
 struct SelectObjectContentArgs : public ObjectReadArgs {
-  SelectRequest& request;
+  SelectRequest request;
   SelectResultFunction resultfunc = nullptr;
 
   SelectObjectContentArgs(SelectRequest& req, SelectResultFunction func)
@@ -432,7 +469,7 @@ using DeleteBucketNotificationArgs = BucketArgs;
 using GetBucketNotificationArgs = BucketArgs;
 
 struct SetBucketNotificationArgs : public BucketArgs {
-  NotificationConfig& config;
+  NotificationConfig config;
 
   explicit SetBucketNotificationArgs(NotificationConfig& configvalue)
       : config(configvalue) {}
@@ -445,7 +482,7 @@ using DeleteBucketEncryptionArgs = BucketArgs;
 using GetBucketEncryptionArgs = BucketArgs;
 
 struct SetBucketEncryptionArgs : public BucketArgs {
-  SseConfig& config;
+  SseConfig config;
 
   explicit SetBucketEncryptionArgs(SseConfig& sseconfig) : config(sseconfig) {}
 
@@ -471,7 +508,7 @@ using DeleteBucketReplicationArgs = BucketArgs;
 using GetBucketReplicationArgs = BucketArgs;
 
 struct SetBucketReplicationArgs : public BucketArgs {
-  ReplicationConfig& config;
+  ReplicationConfig config;
 
   explicit SetBucketReplicationArgs(ReplicationConfig& value) : config(value) {}
 
@@ -483,7 +520,7 @@ using DeleteBucketLifecycleArgs = BucketArgs;
 using GetBucketLifecycleArgs = BucketArgs;
 
 struct SetBucketLifecycleArgs : public BucketArgs {
-  LifecycleConfig& config;
+  LifecycleConfig config;
 
   explicit SetBucketLifecycleArgs(LifecycleConfig& value) : config(value) {}
 

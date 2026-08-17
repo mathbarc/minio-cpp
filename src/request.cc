@@ -164,6 +164,10 @@ BaseUrl::BaseUrl(std::string host, bool https, std::string region)
 
   this->host = url.host;
   this->port = url.port;
+  // Use parsed URL's https setting if URL was provided with scheme
+  if (host.find("://") != std::string::npos) {
+    this->https = url.https;
+  }
 
   if (!this->region.empty() && !awsRegexMatch(this->region, REGION_REGEX)) {
     this->err_ = error::Error("invalid region " + this->region);
@@ -273,7 +277,7 @@ error::Error BaseUrl::BuildUrl(http::Url& url, http::Method method,
   }
 
   std::string host = url.host;
-  std::string path;
+  std::string path = "/";
 
   if (enforce_path_style || !this->virtual_style) {
     path = "/" + bucket_name;
@@ -282,7 +286,7 @@ error::Error BaseUrl::BuildUrl(http::Url& url, http::Method method,
   }
 
   if (!object_name.empty()) {
-    if (object_name.front() != '/') path += '/';
+    if (!utils::EndsWith(path, "/")) path += '/';
     path += utils::EncodePath(object_name);
   }
 
@@ -308,6 +312,11 @@ void Request::BuildHeaders(http::Url& url, creds::Provider* const provider) {
   bool md5sum_added = headers.Contains("Content-MD5");
   std::string md5sum;
 
+  // Honor a caller-supplied x-amz-content-sha256 (e.g. "UNSIGNED-PAYLOAD"
+  // on GPU-resident bodies) so we don't drag device memory through OpenSSL
+  // just to compute a signing hash that TLS already authenticates.
+  const bool caller_set_sha256 = headers.Contains("x-amz-content-sha256");
+
   switch (method) {
     case http::Method::kPut:
     case http::Method::kPost:
@@ -316,19 +325,23 @@ void Request::BuildHeaders(http::Url& url, creds::Provider* const provider) {
         headers.Add("Content-Type", "application/octet-stream");
       }
       if (provider != nullptr) {
-        sha256 = utils::Sha256Hash(body);
+        sha256 = caller_set_sha256 ? headers.GetFront("x-amz-content-sha256")
+                                   : utils::Sha256Hash(body);
       } else if (!md5sum_added) {
         md5sum = utils::Md5sumHash(body);
       }
       break;
     default:
       if (provider != nullptr) {
-        sha256 = EMPTY_SHA256;
+        sha256 = caller_set_sha256 ? headers.GetFront("x-amz-content-sha256")
+                                   : EMPTY_SHA256;
       }
   }
 
   if (!md5sum.empty()) headers.Add("Content-MD5", md5sum);
-  if (!sha256.empty()) headers.Add("x-amz-content-sha256", sha256);
+  if (!sha256.empty() && !caller_set_sha256) {
+    headers.Add("x-amz-content-sha256", sha256);
+  }
 
   date = utils::UtcTime::Now();
   headers.Add("x-amz-date", date.ToAmzDate());

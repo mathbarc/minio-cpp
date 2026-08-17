@@ -19,6 +19,9 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <curlpp/Easy.hpp>
 #include <curlpp/Exception.hpp>
 #include <curlpp/Infos.hpp>
@@ -30,10 +33,12 @@
 #include <iosfwd>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 #include "miniocpp/error.h"
@@ -49,6 +54,74 @@
 #endif
 
 namespace minio::http {
+
+namespace {
+
+// Abort a transfer that makes no progress for this long. Guards against a
+// connection that drops mid-transfer without a clean close (TCP never RSTs),
+// which would otherwise keep the request alive indefinitely.
+constexpr long kStallTimeoutSecs = 60;
+
+// curl_global_init() is documented as not thread-safe and is expensive
+// (OpenSSL init etc). Run it exactly once per process via a function-local
+// static (Meyers singleton; C++11 [stmt.dcl]/4 guarantees thread-safe
+// initialization), instead of paying the cost — and the race — on every
+// request via a stack-local curlpp::Cleanup.
+void EnsureGlobalCurlInit() {
+  static const curlpp::Cleanup kCleanup;
+  (void)kCleanup;
+}
+
+// Connection, DNS and TLS-session caches, kept per thread.
+//
+// These were once a single process-wide CURLSH with per-slot mutexes, which
+// libcurl's own documentation warns against: a shared connection cache is not
+// safe to use from several threads at once, and this crashed reliably under
+// concurrent PUTs -- a wild pointer read inside curl_multi_perform, with the
+// mutexes held exactly as documented. Bisecting the slots on libcurl 8.5:
+//
+//   none                  clean          CONNECT only          crashes
+//   DNS only              clean          CONNECT + SSL_SESSION crashes
+//   DNS + SSL_SESSION     crashes
+//
+// So the sharing itself is the problem, not one slot. Giving each thread its
+// own share keeps what the share was for -- a connection and TLS session
+// surviving past one Easy handle, so a signed S3 call does not pay a fresh
+// handshake every time -- while removing the cross-thread access entirely.
+// Nothing is shared between threads, so no lock callbacks are needed.
+//
+// The handle is destroyed when its thread exits. Every Easy that used it is
+// stack-local to Request::execute() and long gone by then.
+class ThreadCurlShare {
+ public:
+  ThreadCurlShare() : share_(curl_share_init()) {
+    if (share_ == nullptr) {
+      std::cerr << "curl_share_init failed" << std::endl;
+      std::terminate();
+    }
+    curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+  }
+  ~ThreadCurlShare() {
+    if (share_ != nullptr) curl_share_cleanup(share_);
+  }
+  ThreadCurlShare(const ThreadCurlShare&) = delete;
+  ThreadCurlShare& operator=(const ThreadCurlShare&) = delete;
+
+  CURLSH* get() const { return share_; }
+
+ private:
+  CURLSH* share_;
+};
+
+CURLSH* CurlShare() {
+  EnsureGlobalCurlInit();
+  static thread_local ThreadCurlShare share;
+  return share.get();
+}
+
+}  // namespace
 
 // MethodToString converts http Method enum to string.
 const char* MethodToString(Method method) noexcept {
@@ -146,7 +219,7 @@ Url Url::Parse(std::string value) {
       while (std::getline(ss, portstr, ':')) {
       }
 
-      if (!portstr.empty()) {
+      if (host.find(':') != std::string::npos && !portstr.empty()) {
         try {
           port = static_cast<unsigned>(std::stoi(portstr));
           host = host.substr(0, host.rfind(":" + portstr));
@@ -337,9 +410,27 @@ Request::Request(Method method, Url url) {
 }
 
 Response Request::execute() {
-  curlpp::Cleanup cleaner;
+  EnsureGlobalCurlInit();
   curlpp::Easy request;
   curlpp::Multi requests;
+
+  // Attach this thread's share so connections, DNS resolutions and TLS
+  // sessions survive past this Easy handle's lifetime. Per thread rather than
+  // per process: see CurlShare() for why sharing these across threads
+  // corrupts libcurl's state. Also enable TCP keep-alive so the kernel keeps
+  // pooled sockets healthy across idle gaps between S3 calls. curlpp doesn't
+  // wrap either option, so set via libcurl.
+  CURL* const raw_handle = request.getHandle();
+  curl_easy_setopt(raw_handle, CURLOPT_SHARE, CurlShare());
+  curl_easy_setopt(raw_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+
+  // Fail a stalled transfer instead of hanging forever. Skipped when the caller
+  // set an explicit total timeout (RDMA control plane) — that already bounds
+  // it.
+  if (timeout_secs <= 0) {
+    curl_easy_setopt(raw_handle, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(raw_handle, CURLOPT_LOW_SPEED_TIME, kStallTimeoutSecs);
+  }
 
   // Request settings.
   request.setOpt(new curlpp::options::CustomRequest{MethodToString(method)});
@@ -364,6 +455,16 @@ Response Request::execute() {
     }
   }
 
+  if (!nic_interface.empty()) {
+    request.setOpt(new curlpp::Options::Interface(nic_interface));
+  }
+  if (connect_timeout_secs > 0) {
+    request.setOpt(new curlpp::Options::ConnectTimeout(connect_timeout_secs));
+  }
+  if (timeout_secs > 0) {
+    request.setOpt(new curlpp::Options::Timeout(timeout_secs));
+  }
+
   utils::CharBuffer charbuf((char*)body.data(), body.size());
   std::istream body_stream(&charbuf);
 
@@ -380,8 +481,12 @@ Response Request::execute() {
         headers.Add("Content-Length", std::to_string(body.size()));
       }
       request.setOpt(new curlpp::Options::ReadStream(&body_stream));
-      request.setOpt(
-          new curlpp::Options::InfileSize(static_cast<long>(body.size())));
+      // CURLOPT_INFILESIZE_LARGE (curl_off_t), not CURLOPT_INFILESIZE (long):
+      // the latter is documented to be capped at 2 GiB and silently truncates
+      // the upload for larger single-request bodies (e.g. a >4 GiB buffer that
+      // could not be RDMA-registered and falls back to a single PUT).
+      request.setOpt(new curlpp::Options::InfileSizeLarge(
+          static_cast<curl_off_t>(body.size())));
       request.setOpt(new curlpp::Options::Upload(true));
       break;
   }
@@ -431,7 +536,7 @@ Response Request::execute() {
     fd_set fdread{};
     fd_set fdwrite{};
     fd_set fdexcep{};
-    int maxfd = 0;
+    int maxfd = -1;
 
     FD_ZERO(&fdread);
     FD_ZERO(&fdwrite);
@@ -439,12 +544,40 @@ Response Request::execute() {
 
     requests.fdset(&fdread, &fdwrite, &fdexcep, &maxfd);
 
-    if (select(maxfd + 1, &fdread, &fdwrite, &fdexcep, nullptr) < 0) {
-      std::cerr << "select() failed; this should not happen" << std::endl;
-      std::terminate();
+    // Bound the wait so the loop keeps pumping libcurl even when no socket ever
+    // becomes ready — otherwise a dropped/stalled connection blocks select()
+    // forever and this (synchronous) call hangs the calling thread. The bounded
+    // poll lets libcurl enforce its own timeouts (e.g. the low-speed limit set
+    // above) and abort the dead transfer.
+    if (maxfd < 0) {
+      // libcurl has no fd to wait on yet; select() with empty sets errors out
+      // on Windows, so just poll again shortly.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } else {
+      timeval timeout{};
+      timeout.tv_sec = 1;
+      timeout.tv_usec = 0;
+      if (select(maxfd + 1, &fdread, &fdwrite, &fdexcep, &timeout) < 0) {
+#ifndef _WIN32
+        if (errno == EINTR) continue;  // interrupted by a signal; retry
+#endif
+        std::cerr << "select() failed; this should not happen" << std::endl;
+        std::terminate();
+      }
     }
     while (!requests.perform(&left)) {
     }
+  }
+
+  // The loop exits once libcurl has no running transfers left. If the transfer
+  // aborted before delivering a single byte (e.g. the low-speed limit or
+  // connect timeout fired on a dropped/stalled connection), the write callback
+  // never ran, so neither status_code nor error was set. Surface a diagnostic
+  // instead of returning a silently-empty failure.
+  if (response.error.empty() && response.status_code == 0) {
+    response.error =
+        "transfer ended without a response (connection dropped, timed out, or "
+        "was aborted before any data was received)";
   }
 
   if (progressfunc != nullptr) {

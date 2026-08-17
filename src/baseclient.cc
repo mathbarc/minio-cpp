@@ -20,12 +20,15 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <list>
 #include <map>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <ostream>
 #include <pugixml.hpp>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -42,6 +45,11 @@
 #include "miniocpp/signer.h"
 #include "miniocpp/types.h"
 #include "miniocpp/utils.h"
+
+#ifdef MINIO_CPP_RDMA
+#include "miniocpp/rdma.h"
+#include "miniocpp/rdma_client.h"
+#endif
 
 // We want exactly `minio::s3::BaseClient::GetObject()` symbol and nothing else.
 #if defined(GetObject)
@@ -112,104 +120,93 @@ void BaseClient::HandleRedirectResponse(std::string& code, std::string& message,
   }
 
   if (retry && !region.empty() && method == http::Method::kHead &&
-      !bucket_name.empty() && !region_map_[bucket_name].empty()) {
-    code = "RetryHead";
-    message.clear();
+      !bucket_name.empty()) {
+    std::shared_lock<std::shared_mutex> lock(region_map_mutex_);
+    if (auto it = region_map_.find(bucket_name);
+        it != region_map_.end() && !it->second.empty()) {
+      code = "RetryHead";
+      message.clear();
+    }
   }
 }
 
-Response BaseClient::GetErrorResponse(http::Response resp,
-                                      std::string_view resource,
-                                      http::Method method,
-                                      const std::string& bucket_name,
-                                      const std::string& object_name) {
+Result<Response> BaseClient::GetErrorResponse(
+    http::Response resp, [[maybe_unused]] std::string_view resource,
+    http::Method method, const std::string& bucket_name,
+    const std::string& object_name) {
   if (!resp.error.empty()) {
-    return error::make<Response>(resp.error);
+    return tl::make_unexpected(error::Error(resp.error));
   }
 
   if (!resp.body.empty()) {
     std::list<std::string> values = resp.headers.Get("Content-Type");
     for (auto& value : values) {
       if (utils::Contains(utils::ToLower(value), "application/xml")) {
-        return Response::ParseXML(resp.body, resp.status_code, resp.headers);
+        auto parsed =
+            Response::ParseXML(resp.body, resp.status_code, resp.headers);
+        if (!parsed) {
+          return tl::make_unexpected(parsed.error());
+        }
+        return tl::make_unexpected(
+            error::Error(parsed->code + ": " + parsed->message));
       }
     }
 
-    auto response =
-        error::make<Response>("invalid response received; status code: " +
-                              std::to_string(resp.status_code) +
-                              "; content-type: " + utils::Join(values, ","));
-    response.status_code = resp.status_code;
-    response.headers = resp.headers;
-    return response;
+    return error::make<Response>("invalid response received; status code: " +
+                                 std::to_string(resp.status_code) +
+                                 "; content-type: " + utils::Join(values, ","));
   }
 
-  Response response;
-  response.status_code = resp.status_code;
-  response.headers = resp.headers;
-
+  // Format the error message based on status code.
   switch (resp.status_code) {
     case 301:
     case 307:
-    case 400:
-      HandleRedirectResponse(response.code, response.message, resp.status_code,
-                             method, resp.headers, bucket_name, true);
-      break;
+    case 400: {
+      std::string code;
+      std::string message;
+      HandleRedirectResponse(code, message, resp.status_code, method,
+                             resp.headers, bucket_name, true);
+      if (code == "RetryHead") {
+        return tl::make_unexpected(error::Error("RetryHead"));
+      }
+      return tl::make_unexpected(error::Error(code + ": " + message));
+    }
     case 403:
-      response.code = "AccessDenied";
-      response.message = "Access denied";
-      break;
+      return tl::make_unexpected(error::Error("AccessDenied: Access denied"));
     case 404:
       if (!object_name.empty()) {
-        response.code = "NoSuchKey";
-        response.message = "Object does not exist";
+        return tl::make_unexpected(
+            error::Error("NoSuchKey: Object does not exist"));
       } else if (bucket_name.empty()) {
-        response.code = "NoSuchBucket";
-        response.message = "Bucket does not exist";
+        return tl::make_unexpected(
+            error::Error("NoSuchBucket: Bucket does not exist"));
       } else {
-        response.code = "ResourceNotFound";
-        response.message = "Request resource not found";
+        return tl::make_unexpected(
+            error::Error("ResourceNotFound: Request resource not found"));
       }
-      break;
     case 405:
-      response.code = "MethodNotAllowed";
-      response.message =
-          "The specified method is not allowed against this resource";
-      break;
+      return tl::make_unexpected(error::Error(
+          "MethodNotAllowed: The specified method is not allowed against "
+          "this resource"));
     case 409:
       if (bucket_name.empty()) {
-        response.code = "NoSuchBucket";
-        response.message = "Bucket does not exist";
+        return tl::make_unexpected(
+            error::Error("NoSuchBucket: Bucket does not exist"));
       } else {
-        response.code = "ResourceConflict";
-        response.message = "Request resource conflicts";
+        return tl::make_unexpected(
+            error::Error("ResourceConflict: Request resource conflicts"));
       }
-      break;
     case 501:
-      response.code = "MethodNotAllowed";
-      response.message =
-          "The specified method is not allowed against this resource";
-      break;
-    default: {
-      auto response =
-          error::make<Response>("server failed with HTTP status code " +
-                                std::to_string(resp.status_code));
-      response.status_code = resp.status_code;
-      response.headers = resp.headers;
-      return response;
-    }
+      return tl::make_unexpected(error::Error(
+          "MethodNotAllowed: The specified method is not allowed against "
+          "this resource"));
+    default:
+      return error::make<Response>("server failed with HTTP status code " +
+                                   std::to_string(resp.status_code));
   }
-
-  response.resource = resource;
-  response.request_id = response.headers.GetFront("x-amz-request-id");
-  response.host_id = response.headers.GetFront("x-amz-id-2");
-  response.bucket_name = bucket_name;
-  response.object_name = object_name;
-
-  return response;
 }
 
-Response BaseClient::execute(Request& req) {
+Result<Response> BaseClient::execute(Request& req) {
   req.user_agent = user_agent_;
   req.ignore_cert_check = ignore_cert_check_;
   if (!ssl_cert_file_.empty()) req.ssl_cert_file = ssl_cert_file_;
@@ -224,35 +221,34 @@ Response BaseClient::execute(Request& req) {
     return resp;
   }
 
-  Response resp = GetErrorResponse(response, request.url.path, req.method,
-                                   req.bucket_name, req.object_name);
-  if (resp.code == "NoSuchBucket" || resp.code == "RetryHead") {
-    region_map_.erase(req.bucket_name);
+  auto err = GetErrorResponse(response, request.url.path, req.method,
+                              req.bucket_name, req.object_name);
+  if (!err) {
+    std::string err_str = err.error().String();
+    if (err_str.find("NoSuchBucket") != std::string::npos ||
+        err_str == "RetryHead") {
+      std::unique_lock<std::shared_mutex> lock(region_map_mutex_);
+      region_map_.erase(req.bucket_name);
+    }
   }
-
-  return resp;
+  return err;
 }
 
-Response BaseClient::Execute(Request& req) {
-  Response resp = execute(req);
-  if (resp || resp.code != "RetryHead") return resp;
+Result<Response> BaseClient::Execute(Request& req) {
+  auto exec_resp = execute(req);
+  if (exec_resp) return exec_resp;
+  if (exec_resp.error().String() != "RetryHead") return exec_resp;
 
   // Retry only once on RetryHead error.
-  resp = execute(req);
-  if (resp || resp.code != "RetryHead") return resp;
+  exec_resp = execute(req);
+  if (exec_resp) return exec_resp;
+  if (exec_resp.error().String() != "RetryHead") return exec_resp;
 
-  std::string code;
-  std::string message;
-  HandleRedirectResponse(code, message, resp.status_code, req.method,
-                         resp.headers, req.bucket_name);
-  resp.code = code;
-  resp.message = message;
-
-  return resp;
+  return tl::make_unexpected(exec_resp.error());
 }
 
-GetRegionResponse BaseClient::GetRegion(const std::string& bucket_name,
-                                        const std::string& region) {
+Result<GetRegionResponse> BaseClient::GetRegion(const std::string& bucket_name,
+                                                const std::string& region) {
   std::string base_region = base_url_.region;
   if (!region.empty()) {
     if (!base_region.empty() && base_region != region) {
@@ -271,22 +267,25 @@ GetRegionResponse BaseClient::GetRegion(const std::string& bucket_name,
     return GetRegionResponse("us-east-1");
   }
 
-  std::string stored_region = region_map_[bucket_name];
-  if (!stored_region.empty()) {
-    return GetRegionResponse(stored_region);
+  {
+    std::shared_lock<std::shared_mutex> lock(region_map_mutex_);
+    if (auto it = region_map_.find(bucket_name);
+        it != region_map_.end() && !it->second.empty()) {
+      return GetRegionResponse(it->second);
+    }
   }
   Request req(http::Method::kGet, "us-east-1", base_url_, utils::Multimap(),
               utils::Multimap());
   req.query_params.Add("location", "");
   req.bucket_name = bucket_name;
 
-  Response resp = Execute(req);
-  if (!resp) {
-    return GetRegionResponse(resp);
+  auto exec_gr = Execute(req);
+  if (!exec_gr) {
+    return tl::make_unexpected(exec_gr.error());
   }
 
   pugi::xml_document xdoc;
-  pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+  pugi::xml_parse_result result = xdoc.load_string(exec_gr->data.data());
   if (!result) {
     return error::make<GetRegionResponse>("unable to parse XML");
   }
@@ -299,22 +298,26 @@ GetRegionResponse BaseClient::GetRegion(const std::string& bucket_name,
     if (!base_url_.aws_domain_suffix.empty()) value = "eu-west-1";
   }
 
-  region_map_[bucket_name] = value;
+  {
+    std::unique_lock<std::shared_mutex> lock(region_map_mutex_);
+    region_map_[bucket_name] = value;
+  }
 
   return GetRegionResponse(value);
 }
 
-AbortMultipartUploadResponse BaseClient::AbortMultipartUpload(
+Result<AbortMultipartUploadResponse> BaseClient::AbortMultipartUpload(
     AbortMultipartUploadArgs args) {
   if (error::Error err = args.Validate()) {
-    return AbortMultipartUploadResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return AbortMultipartUploadResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -323,43 +326,47 @@ AbortMultipartUploadResponse BaseClient::AbortMultipartUpload(
   req.object_name = args.object;
   req.query_params.Add("uploadId", args.upload_id);
 
-  return AbortMultipartUploadResponse(Execute(req));
+  auto exec_abort = Execute(req);
+  if (!exec_abort) return tl::make_unexpected(exec_abort.error());
+  return AbortMultipartUploadResponse(std::move(*exec_abort));
 }
 
-BucketExistsResponse BaseClient::BucketExists(BucketExistsArgs args) {
+Result<BucketExistsResponse> BaseClient::BucketExists(BucketExistsArgs args) {
   if (error::Error err = args.Validate()) {
-    return BucketExistsResponse(err);
+    return tl::make_unexpected(err);
   }
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return (resp.code == "NoSuchBucket") ? BucketExistsResponse(false)
-                                         : BucketExistsResponse(resp);
+    if (get_resp.error().String().find("NoSuchBucket") != std::string::npos)
+      return BucketExistsResponse(false);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kHead, region, base_url_, args.extra_headers,
               args.extra_query_params);
   req.bucket_name = args.bucket;
-  if (Response resp = Execute(req)) {
+  auto bucket_exec = Execute(req);
+  if (bucket_exec) {
     return BucketExistsResponse(true);
-  } else {
-    return (resp.code == "NoSuchBucket") ? BucketExistsResponse(false)
-                                         : BucketExistsResponse(resp);
   }
+  return tl::make_unexpected(bucket_exec.error());
 }
 
-CompleteMultipartUploadResponse BaseClient::CompleteMultipartUpload(
+Result<CompleteMultipartUploadResponse> BaseClient::CompleteMultipartUpload(
     CompleteMultipartUploadArgs args) {
   if (error::Error err = args.Validate()) {
-    return CompleteMultipartUploadResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return CompleteMultipartUploadResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPost, region, base_url_, args.extra_headers,
@@ -372,7 +379,12 @@ CompleteMultipartUploadResponse BaseClient::CompleteMultipartUpload(
   ss << "<CompleteMultipartUpload>";
   for (auto& part : args.parts) {
     ss << "<Part>" << "<PartNumber>" << part.number << "</PartNumber>"
-       << "<ETag>" << "\"" << part.etag << "\"" << "</ETag>" << "</Part>";
+       << "<ETag>" << "\"" << part.etag << "\"" << "</ETag>";
+    if (!part.checksum_crc64nvme.empty()) {
+      ss << "<ChecksumCRC64NVME>" << part.checksum_crc64nvme
+         << "</ChecksumCRC64NVME>";
+    }
+    ss << "</Part>";
   }
   ss << "</CompleteMultipartUpload>";
   std::string body = ss.str();
@@ -383,18 +395,18 @@ CompleteMultipartUploadResponse BaseClient::CompleteMultipartUpload(
   headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.headers = headers;
 
-  Response response = Execute(req);
+  auto response = Execute(req);
   if (!response) {
-    return CompleteMultipartUploadResponse(response);
+    return tl::make_unexpected(response.error());
   }
   return CompleteMultipartUploadResponse::ParseXML(
-      response.data, response.headers.GetFront("x-amz-version-id"));
+      response->data, response->headers.GetFront("x-amz-version-id"));
 }
 
-CreateMultipartUploadResponse BaseClient::CreateMultipartUpload(
+Result<CreateMultipartUploadResponse> BaseClient::CreateMultipartUpload(
     CreateMultipartUploadArgs args) {
   if (error::Error err = args.Validate()) {
-    return CreateMultipartUploadResponse(err);
+    return tl::make_unexpected(err);
   }
 
   if (!args.headers.Contains("Content-Type")) {
@@ -402,10 +414,11 @@ CreateMultipartUploadResponse BaseClient::CreateMultipartUpload(
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return CreateMultipartUploadResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPost, region, base_url_, args.extra_headers,
@@ -415,9 +428,9 @@ CreateMultipartUploadResponse BaseClient::CreateMultipartUpload(
   req.query_params.Add("uploads", "");
   req.headers.AddAll(args.headers);
 
-  if (Response resp = Execute(req)) {
+  if (auto resp = Execute(req)) {
     pugi::xml_document xdoc;
-    pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+    pugi::xml_parse_result result = xdoc.load_string(resp->data.data());
     if (!result) {
       return error::make<CreateMultipartUploadResponse>("unable to parse XML");
     }
@@ -425,21 +438,22 @@ CreateMultipartUploadResponse BaseClient::CreateMultipartUpload(
         xdoc.select_node("/InitiateMultipartUploadResult/UploadId/text()");
     return CreateMultipartUploadResponse(std::string(text.node().value()));
   } else {
-    return CreateMultipartUploadResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
 }
 
-DeleteBucketEncryptionResponse BaseClient::DeleteBucketEncryption(
+Result<DeleteBucketEncryptionResponse> BaseClient::DeleteBucketEncryption(
     DeleteBucketEncryptionArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketEncryptionResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteBucketEncryptionResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -447,26 +461,23 @@ DeleteBucketEncryptionResponse BaseClient::DeleteBucketEncryption(
   req.bucket_name = args.bucket;
   req.query_params.Add("encryption", "");
 
-  Response resp = Execute(req);
-  if (resp) {
-    return DeleteBucketEncryptionResponse(resp);
-  }
-  if (resp.code != "ServerSideEncryptionConfigurationNotFoundError") {
-    return DeleteBucketEncryptionResponse(resp);
-  }
-  return DeleteBucketEncryptionResponse();
+  auto enc_resp = Execute(req);
+  if (!enc_resp)
+    return DeleteBucketEncryptionResponse();  // no encryption found
+  return DeleteBucketEncryptionResponse(std::move(*enc_resp));
 }
 
-DisableObjectLegalHoldResponse BaseClient::DisableObjectLegalHold(
+Result<DisableObjectLegalHoldResponse> BaseClient::DisableObjectLegalHold(
     DisableObjectLegalHoldArgs args) {
   if (error::Error err = args.Validate()) {
-    return DisableObjectLegalHoldResponse(err);
+    return tl::make_unexpected(err);
   }
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DisableObjectLegalHoldResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::string body = "<LegalHold><Status>OFF</Status></LegalHold>";
@@ -482,20 +493,23 @@ DisableObjectLegalHoldResponse BaseClient::DisableObjectLegalHold(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return DisableObjectLegalHoldResponse(Execute(req));
+  auto exec_disable = Execute(req);
+  if (!exec_disable) return tl::make_unexpected(exec_disable.error());
+  return DisableObjectLegalHoldResponse(std::move(*exec_disable));
 }
 
-DeleteBucketLifecycleResponse BaseClient::DeleteBucketLifecycle(
+Result<DeleteBucketLifecycleResponse> BaseClient::DeleteBucketLifecycle(
     DeleteBucketLifecycleArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketLifecycleResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteBucketLifecycleResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -503,13 +517,15 @@ DeleteBucketLifecycleResponse BaseClient::DeleteBucketLifecycle(
   req.bucket_name = args.bucket;
   req.query_params.Add("lifecycle", "");
 
-  return DeleteBucketLifecycleResponse(Execute(req));
+  auto exec_life = Execute(req);
+  if (!exec_life) return tl::make_unexpected(exec_life.error());
+  return DeleteBucketLifecycleResponse(std::move(*exec_life));
 }
 
-DeleteBucketNotificationResponse BaseClient::DeleteBucketNotification(
+Result<DeleteBucketNotificationResponse> BaseClient::DeleteBucketNotification(
     DeleteBucketNotificationArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketNotificationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   NotificationConfig config;
@@ -519,20 +535,23 @@ DeleteBucketNotificationResponse BaseClient::DeleteBucketNotification(
   sbnargs.bucket = args.bucket;
   sbnargs.region = args.region;
 
-  return DeleteBucketNotificationResponse(SetBucketNotification(sbnargs));
+  auto notif_resp = SetBucketNotification(sbnargs);
+  if (!notif_resp) return tl::make_unexpected(notif_resp.error());
+  return DeleteBucketNotificationResponse(std::move(*notif_resp));
 }
 
-DeleteBucketPolicyResponse BaseClient::DeleteBucketPolicy(
+Result<DeleteBucketPolicyResponse> BaseClient::DeleteBucketPolicy(
     DeleteBucketPolicyArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketPolicyResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteBucketPolicyResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -540,20 +559,23 @@ DeleteBucketPolicyResponse BaseClient::DeleteBucketPolicy(
   req.bucket_name = args.bucket;
   req.query_params.Add("policy", "");
 
-  return DeleteBucketPolicyResponse(Execute(req));
+  auto exec_set = Execute(req);
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+  return DeleteBucketPolicyResponse(std::move(*exec_set));
 }
 
-DeleteBucketReplicationResponse BaseClient::DeleteBucketReplication(
+Result<DeleteBucketReplicationResponse> BaseClient::DeleteBucketReplication(
     DeleteBucketReplicationArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketReplicationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteBucketReplicationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -561,27 +583,29 @@ DeleteBucketReplicationResponse BaseClient::DeleteBucketReplication(
   req.bucket_name = args.bucket;
   req.query_params.Add("replication", "");
 
-  Response resp = Execute(req);
-  if (resp) {
-    return DeleteBucketReplicationResponse(resp);
+  auto resp = Execute(req);
+  if (!resp) {
+    if (resp.error().String().find("ReplicationConfigurationNotFoundError") ==
+        std::string::npos) {
+      return tl::make_unexpected(resp.error());
+    }
+    return DeleteBucketReplicationResponse();
   }
-  if (resp.code != "ReplicationConfigurationNotFoundError") {
-    return DeleteBucketReplicationResponse(resp);
-  }
-  return DeleteBucketReplicationResponse();
+  return DeleteBucketReplicationResponse(std::move(*resp));
 }
 
-DeleteBucketTagsResponse BaseClient::DeleteBucketTags(
+Result<DeleteBucketTagsResponse> BaseClient::DeleteBucketTags(
     DeleteBucketTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteBucketTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteBucketTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -589,20 +613,25 @@ DeleteBucketTagsResponse BaseClient::DeleteBucketTags(
   req.bucket_name = args.bucket;
   req.query_params.Add("tagging", "");
 
-  return DeleteBucketTagsResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return DeleteBucketTagsResponse(std::move(*exec_set));
 }
 
-DeleteObjectLockConfigResponse BaseClient::DeleteObjectLockConfig(
+Result<DeleteObjectLockConfigResponse> BaseClient::DeleteObjectLockConfig(
     DeleteObjectLockConfigArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteObjectLockConfigResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteObjectLockConfigResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -610,20 +639,25 @@ DeleteObjectLockConfigResponse BaseClient::DeleteObjectLockConfig(
   req.bucket_name = args.bucket;
   req.query_params.Add("object-lock", "");
 
-  return DeleteObjectLockConfigResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return DeleteObjectLockConfigResponse(std::move(*exec_set));
 }
 
-DeleteObjectTagsResponse BaseClient::DeleteObjectTags(
+Result<DeleteObjectTagsResponse> BaseClient::DeleteObjectTags(
     DeleteObjectTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return DeleteObjectTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return DeleteObjectTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -635,20 +669,25 @@ DeleteObjectTagsResponse BaseClient::DeleteObjectTags(
   }
   req.query_params.Add("tagging", "");
 
-  return DeleteObjectTagsResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return DeleteObjectTagsResponse(std::move(*exec_set));
 }
 
-EnableObjectLegalHoldResponse BaseClient::EnableObjectLegalHold(
+Result<EnableObjectLegalHoldResponse> BaseClient::EnableObjectLegalHold(
     EnableObjectLegalHoldArgs args) {
   if (error::Error err = args.Validate()) {
-    return EnableObjectLegalHoldResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return EnableObjectLegalHoldResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::string body = "<LegalHold><Status>ON</Status></LegalHold>";
@@ -664,20 +703,25 @@ EnableObjectLegalHoldResponse BaseClient::EnableObjectLegalHold(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return EnableObjectLegalHoldResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return EnableObjectLegalHoldResponse(std::move(*exec_set));
 }
 
-GetBucketEncryptionResponse BaseClient::GetBucketEncryption(
+Result<GetBucketEncryptionResponse> BaseClient::GetBucketEncryption(
     GetBucketEncryptionArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketEncryptionResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketEncryptionResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -685,24 +729,25 @@ GetBucketEncryptionResponse BaseClient::GetBucketEncryption(
   req.bucket_name = args.bucket;
   req.query_params.Add("encryption", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetBucketEncryptionResponse::ParseXML(resp.data);
+    return GetBucketEncryptionResponse::ParseXML(resp->data);
   }
-  return GetBucketEncryptionResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetBucketLifecycleResponse BaseClient::GetBucketLifecycle(
+Result<GetBucketLifecycleResponse> BaseClient::GetBucketLifecycle(
     GetBucketLifecycleArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketLifecycleResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketLifecycleResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -710,29 +755,31 @@ GetBucketLifecycleResponse BaseClient::GetBucketLifecycle(
   req.bucket_name = args.bucket;
   req.query_params.Add("lifecycle", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
 
   if (!resp) {
-    if (resp.code == "NoSuchLifecycleConfiguration") {
+    if (resp.error().String().find("NoSuchLifecycleConfiguration") !=
+        std::string::npos) {
       return GetBucketLifecycleResponse(LifecycleConfig());
     }
-    return GetBucketLifecycleResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
 
-  return GetBucketLifecycleResponse::ParseXML(resp.data);
+  return GetBucketLifecycleResponse::ParseXML(resp->data);
 }
 
-GetBucketNotificationResponse BaseClient::GetBucketNotification(
+Result<GetBucketNotificationResponse> BaseClient::GetBucketNotification(
     GetBucketNotificationArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketNotificationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketNotificationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -740,23 +787,25 @@ GetBucketNotificationResponse BaseClient::GetBucketNotification(
   req.bucket_name = args.bucket;
   req.query_params.Add("notification", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetBucketNotificationResponse::ParseXML(resp.data);
+    return GetBucketNotificationResponse::ParseXML(resp->data);
   }
-  return GetBucketNotificationResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetBucketPolicyResponse BaseClient::GetBucketPolicy(GetBucketPolicyArgs args) {
+Result<GetBucketPolicyResponse> BaseClient::GetBucketPolicy(
+    GetBucketPolicyArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketPolicyResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketPolicyResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -764,24 +813,25 @@ GetBucketPolicyResponse BaseClient::GetBucketPolicy(GetBucketPolicyArgs args) {
   req.bucket_name = args.bucket;
   req.query_params.Add("policy", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetBucketPolicyResponse(resp.data);
+    return GetBucketPolicyResponse(resp->data);
   }
-  return GetBucketPolicyResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetBucketReplicationResponse BaseClient::GetBucketReplication(
+Result<GetBucketReplicationResponse> BaseClient::GetBucketReplication(
     GetBucketReplicationArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketReplicationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketReplicationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -789,23 +839,25 @@ GetBucketReplicationResponse BaseClient::GetBucketReplication(
   req.bucket_name = args.bucket;
   req.query_params.Add("replication", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetBucketReplicationResponse::ParseXML(resp.data);
+    return GetBucketReplicationResponse::ParseXML(resp->data);
   }
-  return GetBucketReplicationResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetBucketTagsResponse BaseClient::GetBucketTags(GetBucketTagsArgs args) {
+Result<GetBucketTagsResponse> BaseClient::GetBucketTags(
+    GetBucketTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -813,24 +865,25 @@ GetBucketTagsResponse BaseClient::GetBucketTags(GetBucketTagsArgs args) {
   req.bucket_name = args.bucket;
   req.query_params.Add("tagging", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetBucketTagsResponse::ParseXML(resp.data);
+    return GetBucketTagsResponse::ParseXML(resp->data);
   }
-  return GetBucketTagsResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetBucketVersioningResponse BaseClient::GetBucketVersioning(
+Result<GetBucketVersioningResponse> BaseClient::GetBucketVersioning(
     GetBucketVersioningArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetBucketVersioningResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetBucketVersioningResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -838,14 +891,14 @@ GetBucketVersioningResponse BaseClient::GetBucketVersioning(
   req.bucket_name = args.bucket;
   req.query_params.Add("versioning", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return GetBucketVersioningResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
   GetBucketVersioningResponse response;
 
   pugi::xml_document xdoc;
-  pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+  pugi::xml_parse_result result = xdoc.load_string(resp->data.data());
   if (!result) {
     return error::make<GetBucketVersioningResponse>("unable to parse XML");
   }
@@ -854,21 +907,21 @@ GetBucketVersioningResponse BaseClient::GetBucketVersioning(
 
   pugi::xpath_node text;
 
-  if (!root.node().select_node("Status")) {
+  if (root.node().select_node("Status")) {
     text = root.node().select_node("Status/text()");
     response.status = (strcmp(text.node().value(), "Enabled") == 0);
   }
-  if (!root.node().select_node("MFADelete")) {
+  if (root.node().select_node("MFADelete")) {
     text = root.node().select_node("MFADelete/text()");
     response.mfa_delete = (strcmp(text.node().value(), "Enabled") == 0);
   }
 
-  return GetBucketVersioningResponse(response);
+  return response;
 }
 
-GetObjectResponse BaseClient::GetObject(GetObjectArgs args) {
+Result<GetObjectResponse> BaseClient::GetObject(GetObjectArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetObjectResponse(err);
+    return tl::make_unexpected(err);
   }
 
   if (args.ssec != nullptr && !base_url_.https) {
@@ -877,10 +930,11 @@ GetObjectResponse BaseClient::GetObject(GetObjectArgs args) {
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetObjectResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -894,22 +948,27 @@ GetObjectResponse BaseClient::GetObject(GetObjectArgs args) {
   req.userdata = args.userdata;
   req.progressfunc = args.progressfunc;
   req.progress_userdata = args.progress_userdata;
-  if (args.ssec != nullptr) req.headers.AddAll(args.ssec->Headers());
+  req.headers.AddAll(args.Headers());
 
-  return GetObjectResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return GetObjectResponse(std::move(*exec_set));
 }
 
-GetObjectLockConfigResponse BaseClient::GetObjectLockConfig(
+Result<GetObjectLockConfigResponse> BaseClient::GetObjectLockConfig(
     GetObjectLockConfigArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetObjectLockConfigResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetObjectLockConfigResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -917,12 +976,12 @@ GetObjectLockConfigResponse BaseClient::GetObjectLockConfig(
   req.bucket_name = args.bucket;
   req.query_params.Add("object-lock", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return GetObjectLockConfigResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
   pugi::xml_document xdoc;
-  pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+  pugi::xml_parse_result result = xdoc.load_string(resp->data.data());
   if (!result) {
     return error::make<GetObjectLockConfigResponse>("unable to parse XML");
   }
@@ -950,17 +1009,18 @@ GetObjectLockConfigResponse BaseClient::GetObjectLockConfig(
   return GetObjectLockConfigResponse(config);
 }
 
-GetObjectRetentionResponse BaseClient::GetObjectRetention(
+Result<GetObjectRetentionResponse> BaseClient::GetObjectRetention(
     GetObjectRetentionArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetObjectRetentionResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetObjectRetentionResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -974,16 +1034,17 @@ GetObjectRetentionResponse BaseClient::GetObjectRetention(
 
   GetObjectRetentionResponse response;
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    if (resp.code == "NoSuchObjectLockConfiguration") {
-      return GetObjectRetentionResponse(response);
+    if (resp.error().String().find("NoSuchObjectLockConfiguration") !=
+        std::string::npos) {
+      return response;
     }
-    return GetObjectRetentionResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
 
   pugi::xml_document xdoc;
-  pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+  pugi::xml_parse_result result = xdoc.load_string(resp->data.data());
   if (!result) {
     return error::make<GetObjectRetentionResponse>("unable to parse XML");
   }
@@ -995,19 +1056,21 @@ GetObjectRetentionResponse BaseClient::GetObjectRetention(
   response.retain_until_date =
       utils::UtcTime::FromISO8601UTC(text.node().value());
 
-  return GetObjectRetentionResponse(response);
+  return response;
 }
 
-GetObjectTagsResponse BaseClient::GetObjectTags(GetObjectTagsArgs args) {
+Result<GetObjectTagsResponse> BaseClient::GetObjectTags(
+    GetObjectTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetObjectTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetObjectTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -1019,24 +1082,25 @@ GetObjectTagsResponse BaseClient::GetObjectTags(GetObjectTagsArgs args) {
   }
   req.query_params.Add("tagging", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
-    return GetObjectTagsResponse::ParseXML(resp.data);
+    return GetObjectTagsResponse::ParseXML(resp->data);
   }
-  return GetObjectTagsResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-GetPresignedObjectUrlResponse BaseClient::GetPresignedObjectUrl(
+Result<GetPresignedObjectUrlResponse> BaseClient::GetPresignedObjectUrl(
     GetPresignedObjectUrlArgs args) {
   if (error::Error err = args.Validate()) {
-    return GetPresignedObjectUrlResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetPresignedObjectUrlResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   utils::Multimap query_params;
@@ -1070,23 +1134,23 @@ GetPresignedObjectUrlResponse BaseClient::GetPresignedObjectUrl(
   return GetPresignedObjectUrlResponse(url.String());
 }
 
-GetPresignedPostFormDataResponse BaseClient::GetPresignedPostFormData(
+Result<GetPresignedPostFormDataResponse> BaseClient::GetPresignedPostFormData(
     PostPolicy policy) {
   if (!policy) {
-    return error::make<GetPresignedPostFormDataResponse>(
-        "valid policy must be provided");
+    return tl::make_unexpected(error::Error("valid policy must be provided"));
   }
 
   if (provider_ == nullptr) {
-    return error::make<GetPresignedPostFormDataResponse>(
-        "Anonymous access does not require pre-signed post form-data");
+    return tl::make_unexpected(error::Error(
+        "Anonymous access does not require pre-signed post form-data"));
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(policy.bucket, policy.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(policy.bucket, policy.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return GetPresignedPostFormDataResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   creds::Credentials creds = provider_->Fetch();
@@ -1094,22 +1158,23 @@ GetPresignedPostFormDataResponse BaseClient::GetPresignedPostFormData(
   if (error::Error err =
           policy.FormData(data, creds.access_key, creds.secret_key,
                           creds.session_token, region)) {
-    return GetPresignedPostFormDataResponse(err);
+    return tl::make_unexpected(err);
   }
   return GetPresignedPostFormDataResponse(data);
 }
 
-IsObjectLegalHoldEnabledResponse BaseClient::IsObjectLegalHoldEnabled(
+Result<IsObjectLegalHoldEnabledResponse> BaseClient::IsObjectLegalHoldEnabled(
     IsObjectLegalHoldEnabledArgs args) {
   if (error::Error err = args.Validate()) {
-    return IsObjectLegalHoldEnabledResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return IsObjectLegalHoldEnabledResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -1121,16 +1186,17 @@ IsObjectLegalHoldEnabledResponse BaseClient::IsObjectLegalHoldEnabled(
   }
   req.query_params.Add("legal-hold", "");
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    if (resp.code == "NoSuchObjectLockConfiguration") {
+    if (resp.error().String().find("NoSuchObjectLockConfiguration") !=
+        std::string::npos) {
       return IsObjectLegalHoldEnabledResponse(false);
     }
-    return IsObjectLegalHoldEnabledResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
 
   pugi::xml_document xdoc;
-  pugi::xml_parse_result result = xdoc.load_string(resp.data.data());
+  pugi::xml_parse_result result = xdoc.load_string(resp->data.data());
   if (!result) {
     return error::make<IsObjectLegalHoldEnabledResponse>("unable to parse XML");
   }
@@ -1139,24 +1205,24 @@ IsObjectLegalHoldEnabledResponse BaseClient::IsObjectLegalHoldEnabled(
   return IsObjectLegalHoldEnabledResponse(value == "ON");
 }
 
-ListBucketsResponse BaseClient::ListBuckets(ListBucketsArgs args) {
+Result<ListBucketsResponse> BaseClient::ListBuckets(ListBucketsArgs args) {
   Request req(http::Method::kGet, base_url_.region, base_url_,
               args.extra_headers, args.extra_query_params);
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return ListBucketsResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
-  return ListBucketsResponse::ParseXML(resp.data);
+  return ListBucketsResponse::ParseXML(resp->data);
 }
 
-ListBucketsResponse BaseClient::ListBuckets() {
+Result<ListBucketsResponse> BaseClient::ListBuckets() {
   return ListBuckets(ListBucketsArgs());
 }
 
-ListenBucketNotificationResponse BaseClient::ListenBucketNotification(
+Result<ListenBucketNotificationResponse> BaseClient::ListenBucketNotification(
     ListenBucketNotificationArgs args) {
   if (error::Error err = args.Validate()) {
-    return ListenBucketNotificationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   if (!base_url_.aws_domain_suffix.empty()) {
@@ -1165,10 +1231,11 @@ ListenBucketNotificationResponse BaseClient::ListenBucketNotification(
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return ListenBucketNotificationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req = Request(http::Method::kGet, region, base_url_,
@@ -1214,19 +1281,24 @@ ListenBucketNotificationResponse BaseClient::ListenBucketNotification(
     }
   };
 
-  return ListenBucketNotificationResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return ListenBucketNotificationResponse(std::move(*exec_set));
 }
 
-ListObjectsResponse BaseClient::ListObjectsV1(ListObjectsV1Args args) {
+Result<ListObjectsResponse> BaseClient::ListObjectsV1(ListObjectsV1Args args) {
   if (error::Error err = args.Validate()) {
-    return ListObjectsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -1237,23 +1309,24 @@ ListObjectsResponse BaseClient::ListObjectsV1(ListObjectsV1Args args) {
   if (!args.marker.empty()) {
     req.query_params.Add("marker", args.marker);
   }
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
-  return ListObjectsResponse::ParseXML(resp.data, false);
+  return ListObjectsResponse::ParseXML(resp->data, false);
 }
 
-ListObjectsResponse BaseClient::ListObjectsV2(ListObjectsV2Args args) {
+Result<ListObjectsResponse> BaseClient::ListObjectsV2(ListObjectsV2Args args) {
   if (error::Error err = args.Validate()) {
-    return ListObjectsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -1274,24 +1347,25 @@ ListObjectsResponse BaseClient::ListObjectsV2(ListObjectsV2Args args) {
   if (args.include_user_metadata) {
     req.query_params.Add("metadata", "true");
   }
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
-  return ListObjectsResponse::ParseXML(resp.data, false);
+  return ListObjectsResponse::ParseXML(resp->data, false);
 }
 
-ListObjectsResponse BaseClient::ListObjectVersions(
+Result<ListObjectsResponse> BaseClient::ListObjectVersions(
     ListObjectVersionsArgs args) {
   if (error::Error err = args.Validate()) {
-    return ListObjectsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kGet, region, base_url_, args.extra_headers,
@@ -1307,16 +1381,16 @@ ListObjectsResponse BaseClient::ListObjectVersions(
     req.query_params.Add("version-id-marker", args.version_id_marker);
   }
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (!resp) {
-    return ListObjectsResponse(resp);
+    return tl::make_unexpected(resp.error());
   }
-  return ListObjectsResponse::ParseXML(resp.data, true);
+  return ListObjectsResponse::ParseXML(resp->data, true);
 }
 
-MakeBucketResponse BaseClient::MakeBucket(MakeBucketArgs args) {
+Result<MakeBucketResponse> BaseClient::MakeBucket(MakeBucketArgs args) {
   if (error::Error err = args.Validate()) {
-    return MakeBucketResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region = args.region;
@@ -1348,24 +1422,50 @@ MakeBucketResponse BaseClient::MakeBucket(MakeBucketArgs args) {
     req.body = body;
   }
 
-  Response resp = Execute(req);
+  auto resp = Execute(req);
   if (resp) {
+    std::unique_lock<std::shared_mutex> lock(region_map_mutex_);
     region_map_[args.bucket] = region;
+    return MakeBucketResponse(std::move(*resp));
   }
-  return MakeBucketResponse(resp);
+  return tl::make_unexpected(resp.error());
 }
 
-PutObjectResponse BaseClient::PutObject(PutObjectApiArgs args) {
+Result<PutObjectResponse> BaseClient::PutObject(PutObjectApiArgs args) {
   if (error::Error err = args.Validate()) {
-    return PutObjectResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return PutObjectResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
+
+#ifdef MINIO_CPP_RDMA
+  if (args.rdmaclient != nullptr && args.rdmaclient->Ready()) {
+    minio::rdma::ClientCtx putCtx = {
+        .provider = provider_,
+        .bucket = args.bucket,
+        .object = args.object,
+        .url = base_url_,
+        .region = region,
+    };
+
+    ssize_t ret =
+        rdmaPutWithRetry(args.rdmaclient, &putCtx, args.buf, args.size);
+    if (ret > 0) {
+      PutObjectResponse resp;
+      resp.etag = putCtx.etag;
+      resp.checksum_crc64nvme = putCtx.checksum;
+      return resp;
+    }
+    // ret < 0 (retries exhausted) or kRDMANotSupported (server declined):
+    // fall through to HTTP path.
+  }
+#endif
 
   Request req(http::Method::kPut, region, base_url_, args.extra_headers,
               args.extra_query_params);
@@ -1377,46 +1477,57 @@ PutObjectResponse BaseClient::PutObject(PutObjectApiArgs args) {
   req.progressfunc = args.progressfunc;
   req.progress_userdata = args.progress_userdata;
 
-  Response response = Execute(req);
+  auto response = Execute(req);
   if (!response) {
-    return PutObjectResponse(response);
+    return tl::make_unexpected(response.error());
   }
+
   PutObjectResponse resp;
-  resp.etag = utils::Trim(response.headers.GetFront("etag"), '"');
-  resp.version_id = response.headers.GetFront("x-amz-version-id");
+  resp.etag = utils::Trim(response->headers.GetFront("etag"), '"');
+  resp.version_id = response->headers.GetFront("x-amz-version-id");
+  resp.checksumCRC32 = response->headers.GetFront("x-amz-checksum-crc32");
+  resp.checksumCRC32C = response->headers.GetFront("x-amz-checksum-crc32c");
+  resp.checksumSHA1 = response->headers.GetFront("x-amz-checksum-sha1");
+  resp.checksumSHA256 = response->headers.GetFront("x-amz-checksum-sha256");
 
   return resp;
 }
 
-RemoveBucketResponse BaseClient::RemoveBucket(RemoveBucketArgs args) {
+Result<RemoveBucketResponse> BaseClient::RemoveBucket(RemoveBucketArgs args) {
   if (error::Error err = args.Validate()) {
-    return RemoveBucketResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return RemoveBucketResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
               args.extra_query_params);
   req.bucket_name = args.bucket;
 
-  return RemoveBucketResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return RemoveBucketResponse(std::move(*exec_set));
 }
 
-RemoveObjectResponse BaseClient::RemoveObject(RemoveObjectArgs args) {
+Result<RemoveObjectResponse> BaseClient::RemoveObject(RemoveObjectArgs args) {
   if (error::Error err = args.Validate()) {
-    return RemoveObjectResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return RemoveObjectResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kDelete, region, base_url_, args.extra_headers,
@@ -1427,19 +1538,25 @@ RemoveObjectResponse BaseClient::RemoveObject(RemoveObjectArgs args) {
     req.query_params.Add("versionId", args.version_id);
   }
 
-  return RemoveObjectResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return RemoveObjectResponse(std::move(*exec_set));
 }
 
-RemoveObjectsResponse BaseClient::RemoveObjects(RemoveObjectsApiArgs args) {
+Result<RemoveObjectsResponse> BaseClient::RemoveObjects(
+    RemoveObjectsApiArgs args) {
   if (error::Error err = args.Validate()) {
-    return RemoveObjectsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return RemoveObjectsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPost, region, base_url_, args.extra_headers,
@@ -1455,7 +1572,7 @@ RemoveObjectsResponse BaseClient::RemoveObjects(RemoveObjectsApiArgs args) {
   if (args.quiet) ss << "<Quiet>true</Quiet>";
   for (auto& object : args.objects) {
     ss << "<Object>";
-    ss << "<Key>" << object.name << "</Key>";
+    ss << "<Key>" << utils::XMLEncode(object.name) << "</Key>";
     if (!object.version_id.empty()) {
       ss << "<VersionId>" << object.version_id << "</VersionId>";
     }
@@ -1467,17 +1584,17 @@ RemoveObjectsResponse BaseClient::RemoveObjects(RemoveObjectsApiArgs args) {
   req.headers.Add("Content-Type", "application/xml");
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
 
-  Response response = Execute(req);
+  auto response = Execute(req);
   if (!response) {
-    return RemoveObjectsResponse(response);
+    return tl::make_unexpected(response.error());
   }
-  return RemoveObjectsResponse::ParseXML(response.data);
+  return RemoveObjectsResponse::ParseXML(response->data);
 }
 
-SelectObjectContentResponse BaseClient::SelectObjectContent(
+Result<SelectObjectContentResponse> BaseClient::SelectObjectContent(
     SelectObjectContentArgs args) {
   if (error::Error err = args.Validate()) {
-    return SelectObjectContentResponse(err);
+    return tl::make_unexpected(err);
   }
 
   if (args.ssec != nullptr && !base_url_.https) {
@@ -1486,10 +1603,11 @@ SelectObjectContentResponse BaseClient::SelectObjectContent(
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SelectObjectContentResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPost, region, base_url_, args.extra_headers,
@@ -1506,20 +1624,25 @@ SelectObjectContentResponse BaseClient::SelectObjectContent(
   using namespace std::placeholders;
   req.datafunc = std::bind(&SelectHandler::DataFunction, &handler, _1);
 
-  return SelectObjectContentResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SelectObjectContentResponse(std::move(*exec_set));
 }
 
-SetBucketEncryptionResponse BaseClient::SetBucketEncryption(
+Result<SetBucketEncryptionResponse> BaseClient::SetBucketEncryption(
     SetBucketEncryptionArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketEncryptionResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketEncryptionResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1541,20 +1664,25 @@ SetBucketEncryptionResponse BaseClient::SetBucketEncryption(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketEncryptionResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketEncryptionResponse(std::move(*exec_set));
 }
 
-SetBucketLifecycleResponse BaseClient::SetBucketLifecycle(
+Result<SetBucketLifecycleResponse> BaseClient::SetBucketLifecycle(
     SetBucketLifecycleArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketLifecycleResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketLifecycleResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::string body = args.config.ToXML();
@@ -1566,20 +1694,25 @@ SetBucketLifecycleResponse BaseClient::SetBucketLifecycle(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketLifecycleResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketLifecycleResponse(std::move(*exec_set));
 }
 
-SetBucketNotificationResponse BaseClient::SetBucketNotification(
+Result<SetBucketNotificationResponse> BaseClient::SetBucketNotification(
     SetBucketNotificationArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketNotificationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketNotificationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::string body = args.config.ToXML();
@@ -1591,19 +1724,25 @@ SetBucketNotificationResponse BaseClient::SetBucketNotification(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketNotificationResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketNotificationResponse(std::move(*exec_set));
 }
 
-SetBucketPolicyResponse BaseClient::SetBucketPolicy(SetBucketPolicyArgs args) {
+Result<SetBucketPolicyResponse> BaseClient::SetBucketPolicy(
+    SetBucketPolicyArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketPolicyResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketPolicyResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPut, region, base_url_, args.extra_headers,
@@ -1613,20 +1752,25 @@ SetBucketPolicyResponse BaseClient::SetBucketPolicy(SetBucketPolicyArgs args) {
   req.body = args.policy;
   req.headers.Add("Content-MD5", utils::Md5sumHash(args.policy));
 
-  return SetBucketPolicyResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketPolicyResponse(std::move(*exec_set));
 }
 
-SetBucketReplicationResponse BaseClient::SetBucketReplication(
+Result<SetBucketReplicationResponse> BaseClient::SetBucketReplication(
     SetBucketReplicationArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketReplicationResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketReplicationResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::string body = args.config.ToXML();
@@ -1638,19 +1782,25 @@ SetBucketReplicationResponse BaseClient::SetBucketReplication(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketReplicationResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketReplicationResponse(std::move(*exec_set));
 }
 
-SetBucketTagsResponse BaseClient::SetBucketTags(SetBucketTagsArgs args) {
+Result<SetBucketTagsResponse> BaseClient::SetBucketTags(
+    SetBucketTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1674,20 +1824,25 @@ SetBucketTagsResponse BaseClient::SetBucketTags(SetBucketTagsArgs args) {
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketTagsResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketTagsResponse(std::move(*exec_set));
 }
 
-SetBucketVersioningResponse BaseClient::SetBucketVersioning(
+Result<SetBucketVersioningResponse> BaseClient::SetBucketVersioning(
     SetBucketVersioningArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetBucketVersioningResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetBucketVersioningResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1710,20 +1865,25 @@ SetBucketVersioningResponse BaseClient::SetBucketVersioning(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetBucketVersioningResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetBucketVersioningResponse(std::move(*exec_set));
 }
 
-SetObjectLockConfigResponse BaseClient::SetObjectLockConfig(
+Result<SetObjectLockConfigResponse> BaseClient::SetObjectLockConfig(
     SetObjectLockConfigArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetObjectLockConfigResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetObjectLockConfigResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1756,20 +1916,25 @@ SetObjectLockConfigResponse BaseClient::SetObjectLockConfig(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetObjectLockConfigResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetObjectLockConfigResponse(std::move(*exec_set));
 }
 
-SetObjectRetentionResponse BaseClient::SetObjectRetention(
+Result<SetObjectRetentionResponse> BaseClient::SetObjectRetention(
     SetObjectRetentionArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetObjectRetentionResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetObjectRetentionResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1791,19 +1956,25 @@ SetObjectRetentionResponse BaseClient::SetObjectRetention(
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetObjectRetentionResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetObjectRetentionResponse(std::move(*exec_set));
 }
 
-SetObjectTagsResponse BaseClient::SetObjectTags(SetObjectTagsArgs args) {
+Result<SetObjectTagsResponse> BaseClient::SetObjectTags(
+    SetObjectTagsArgs args) {
   if (error::Error err = args.Validate()) {
-    return SetObjectTagsResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return SetObjectTagsResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   std::stringstream ss;
@@ -1831,12 +2002,16 @@ SetObjectTagsResponse BaseClient::SetObjectTags(SetObjectTagsArgs args) {
   req.headers.Add("Content-MD5", utils::Md5sumHash(body));
   req.body = std::move(body);
 
-  return SetObjectTagsResponse(Execute(req));
+  auto exec_set = Execute(req);
+
+  if (!exec_set) return tl::make_unexpected(exec_set.error());
+
+  return SetObjectTagsResponse(std::move(*exec_set));
 }
 
-StatObjectResponse BaseClient::StatObject(StatObjectArgs args) {
+Result<StatObjectResponse> BaseClient::StatObject(StatObjectArgs args) {
   if (error::Error err = args.Validate()) {
-    return StatObjectResponse(err);
+    return tl::make_unexpected(err);
   }
 
   if (args.ssec != nullptr && !base_url_.https) {
@@ -1845,10 +2020,11 @@ StatObjectResponse BaseClient::StatObject(StatObjectArgs args) {
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return StatObjectResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kHead, region, base_url_, args.extra_headers,
@@ -1860,45 +2036,45 @@ StatObjectResponse BaseClient::StatObject(StatObjectArgs args) {
   }
   req.headers.AddAll(args.Headers());
 
-  Response response = Execute(req);
+  auto response = Execute(req);
   if (!response) {
-    return StatObjectResponse(response);
+    return tl::make_unexpected(response.error());
   }
-  StatObjectResponse resp(response);
+  StatObjectResponse resp(std::move(*response));
   resp.bucket_name = args.bucket;
   resp.object_name = args.object;
-  resp.version_id = response.headers.GetFront("x-amz-version-id");
+  resp.version_id = response->headers.GetFront("x-amz-version-id");
 
-  resp.etag = utils::Trim(response.headers.GetFront("etag"), '"');
+  resp.etag = utils::Trim(response->headers.GetFront("etag"), '"');
 
-  std::string value = response.headers.GetFront("content-length");
+  std::string value = response->headers.GetFront("content-length");
   if (!value.empty()) resp.size = std::stol(value);
 
-  value = response.headers.GetFront("last-modified");
+  value = response->headers.GetFront("last-modified");
   if (!value.empty()) {
     resp.last_modified = utils::UtcTime::FromHttpHeaderValue(value.c_str());
   }
 
-  value = response.headers.GetFront("x-amz-object-lock-mode");
+  value = response->headers.GetFront("x-amz-object-lock-mode");
   if (!value.empty()) resp.retention_mode = StringToRetentionMode(value);
 
-  value = response.headers.GetFront("x-amz-object-lock-retain-until-date");
+  value = response->headers.GetFront("x-amz-object-lock-retain-until-date");
   if (!value.empty()) {
     resp.retention_retain_until_date =
         utils::UtcTime::FromISO8601UTC(value.c_str());
   }
 
-  value = response.headers.GetFront("x-amz-object-lock-legal-hold");
+  value = response->headers.GetFront("x-amz-object-lock-legal-hold");
   if (!value.empty()) resp.legal_hold = StringToLegalHold(value);
 
-  value = response.headers.GetFront("x-amz-delete-marker");
+  value = response->headers.GetFront("x-amz-delete-marker");
   if (!value.empty()) resp.delete_marker = utils::StringToBool(value);
 
   utils::Multimap user_metadata;
-  std::list<std::string> keys = response.headers.Keys();
+  std::list<std::string> keys = response->headers.Keys();
   for (auto key : keys) {
     if (utils::StartsWith(key, "x-amz-meta-")) {
-      std::list<std::string> values = response.headers.Get(key);
+      std::list<std::string> values = response->headers.Get(key);
       key.erase(0, 11);
       for (auto value : values) user_metadata.Add(key, value);
     }
@@ -1908,10 +2084,44 @@ StatObjectResponse BaseClient::StatObject(StatObjectArgs args) {
   return resp;
 }
 
-UploadPartResponse BaseClient::UploadPart(UploadPartArgs args) {
+Result<UploadPartResponse> BaseClient::UploadPart(UploadPartArgs args) {
   if (error::Error err = args.Validate()) {
-    return UploadPartResponse(err);
+    return tl::make_unexpected(err);
   }
+
+#ifdef MINIO_CPP_RDMA
+  if (args.rdmaclient != nullptr && args.rdmaclient->Ready()) {
+    std::string region;
+    auto get_resp = GetRegion(args.bucket, args.region);
+    if (get_resp) {
+      region = get_resp->region;
+    } else {
+      return tl::make_unexpected(get_resp.error());
+    }
+
+    minio::rdma::ClientCtx putCtx = {
+        .provider = provider_,
+        .bucket = args.bucket,
+        .object = args.object,
+        .uploadId = args.upload_id,
+        .partNumber = args.part_number,
+        .url = base_url_,
+        .region = region,
+        .checksum = args.checksum_crc64nvme,
+    };
+
+    ssize_t ret =
+        rdmaPutWithRetry(args.rdmaclient, &putCtx, args.buf, args.part_size);
+    if (ret > 0) {
+      UploadPartResponse resp;
+      resp.etag = putCtx.etag;
+      resp.checksum_crc64nvme = putCtx.checksum;
+      return resp;
+    }
+    // ret < 0 (retries exhausted) or kRDMANotSupported (server declined):
+    // fall through to HTTP upload part path.
+  }
+#endif
 
   utils::Multimap query_params;
   query_params.Add("partNumber", std::to_string(args.part_number));
@@ -1924,23 +2134,28 @@ UploadPartResponse BaseClient::UploadPart(UploadPartArgs args) {
   api_args.region = args.region;
   api_args.object = args.object;
   api_args.data = args.data;
+  api_args.headers = args.headers;
   api_args.progressfunc = args.progressfunc;
   api_args.progress_userdata = args.progress_userdata;
   api_args.query_params = query_params;
 
-  return UploadPartResponse(PutObject(api_args));
+  auto put_obj = PutObject(api_args);
+  if (!put_obj) return tl::make_unexpected(put_obj.error());
+  return UploadPartResponse(std::move(*put_obj));
 }
 
-UploadPartCopyResponse BaseClient::UploadPartCopy(UploadPartCopyArgs args) {
+Result<UploadPartCopyResponse> BaseClient::UploadPartCopy(
+    UploadPartCopyArgs args) {
   if (error::Error err = args.Validate()) {
-    return UploadPartCopyResponse(err);
+    return tl::make_unexpected(err);
   }
 
   std::string region;
-  if (GetRegionResponse resp = GetRegion(args.bucket, args.region)) {
-    region = resp.region;
+  auto get_resp = GetRegion(args.bucket, args.region);
+  if (get_resp) {
+    region = get_resp->region;
   } else {
-    return UploadPartCopyResponse(resp);
+    return tl::make_unexpected(get_resp.error());
   }
 
   Request req(http::Method::kPut, region, base_url_, args.extra_headers,
@@ -1952,14 +2167,443 @@ UploadPartCopyResponse BaseClient::UploadPartCopy(UploadPartCopyArgs args) {
   req.query_params.Add("uploadId", args.upload_id);
   req.headers.AddAll(args.headers);
 
-  Response response = Execute(req);
+  auto response = Execute(req);
   if (!response) {
-    return UploadPartCopyResponse(response);
+    return tl::make_unexpected(response.error());
   }
   UploadPartCopyResponse resp;
-  resp.etag = utils::Trim(response.headers.GetFront("etag"), '"');
+  resp.etag = utils::Trim(response->headers.GetFront("etag"), '"');
 
   return resp;
+}
+
+// ---- Async overloads ----
+
+std::future<Result<AbortMultipartUploadResponse>>
+BaseClient::AbortMultipartUploadAsync(AbortMultipartUploadArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return AbortMultipartUpload(std::move(args));
+                    });
+}
+
+std::future<Result<BucketExistsResponse>> BaseClient::BucketExistsAsync(
+    BucketExistsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return BucketExists(std::move(args));
+                    });
+}
+
+std::future<Result<CompleteMultipartUploadResponse>>
+BaseClient::CompleteMultipartUploadAsync(CompleteMultipartUploadArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return CompleteMultipartUpload(std::move(args));
+                    });
+}
+
+std::future<Result<CreateMultipartUploadResponse>>
+BaseClient::CreateMultipartUploadAsync(CreateMultipartUploadArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return CreateMultipartUpload(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketEncryptionResponse>>
+BaseClient::DeleteBucketEncryptionAsync(DeleteBucketEncryptionArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketEncryption(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketLifecycleResponse>>
+BaseClient::DeleteBucketLifecycleAsync(DeleteBucketLifecycleArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketLifecycle(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketNotificationResponse>>
+BaseClient::DeleteBucketNotificationAsync(DeleteBucketNotificationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketNotification(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketPolicyResponse>>
+BaseClient::DeleteBucketPolicyAsync(DeleteBucketPolicyArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketPolicy(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketReplicationResponse>>
+BaseClient::DeleteBucketReplicationAsync(DeleteBucketReplicationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketReplication(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteBucketTagsResponse>> BaseClient::DeleteBucketTagsAsync(
+    DeleteBucketTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteBucketTags(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteObjectLockConfigResponse>>
+BaseClient::DeleteObjectLockConfigAsync(DeleteObjectLockConfigArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteObjectLockConfig(std::move(args));
+                    });
+}
+
+std::future<Result<DeleteObjectTagsResponse>> BaseClient::DeleteObjectTagsAsync(
+    DeleteObjectTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DeleteObjectTags(std::move(args));
+                    });
+}
+
+std::future<Result<DisableObjectLegalHoldResponse>>
+BaseClient::DisableObjectLegalHoldAsync(DisableObjectLegalHoldArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return DisableObjectLegalHold(std::move(args));
+                    });
+}
+
+std::future<Result<EnableObjectLegalHoldResponse>>
+BaseClient::EnableObjectLegalHoldAsync(EnableObjectLegalHoldArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return EnableObjectLegalHold(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketEncryptionResponse>>
+BaseClient::GetBucketEncryptionAsync(GetBucketEncryptionArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketEncryption(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketLifecycleResponse>>
+BaseClient::GetBucketLifecycleAsync(GetBucketLifecycleArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketLifecycle(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketNotificationResponse>>
+BaseClient::GetBucketNotificationAsync(GetBucketNotificationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketNotification(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketPolicyResponse>> BaseClient::GetBucketPolicyAsync(
+    GetBucketPolicyArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketPolicy(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketReplicationResponse>>
+BaseClient::GetBucketReplicationAsync(GetBucketReplicationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketReplication(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketTagsResponse>> BaseClient::GetBucketTagsAsync(
+    GetBucketTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketTags(std::move(args));
+                    });
+}
+
+std::future<Result<GetBucketVersioningResponse>>
+BaseClient::GetBucketVersioningAsync(GetBucketVersioningArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetBucketVersioning(std::move(args));
+                    });
+}
+
+std::future<Result<GetObjectResponse>> BaseClient::GetObjectAsync(
+    GetObjectArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetObject(std::move(args));
+                    });
+}
+
+std::future<Result<GetObjectLockConfigResponse>>
+BaseClient::GetObjectLockConfigAsync(GetObjectLockConfigArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetObjectLockConfig(std::move(args));
+                    });
+}
+
+std::future<Result<GetObjectRetentionResponse>>
+BaseClient::GetObjectRetentionAsync(GetObjectRetentionArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetObjectRetention(std::move(args));
+                    });
+}
+
+std::future<Result<GetObjectTagsResponse>> BaseClient::GetObjectTagsAsync(
+    GetObjectTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetObjectTags(std::move(args));
+                    });
+}
+
+std::future<Result<GetPresignedObjectUrlResponse>>
+BaseClient::GetPresignedObjectUrlAsync(GetPresignedObjectUrlArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return GetPresignedObjectUrl(std::move(args));
+                    });
+}
+
+std::future<Result<GetPresignedPostFormDataResponse>>
+BaseClient::GetPresignedPostFormDataAsync(PostPolicy policy) {
+  return std::async(std::launch::async,
+                    [this, policy = std::move(policy)]() mutable {
+                      return GetPresignedPostFormData(std::move(policy));
+                    });
+}
+
+std::future<Result<IsObjectLegalHoldEnabledResponse>>
+BaseClient::IsObjectLegalHoldEnabledAsync(IsObjectLegalHoldEnabledArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return IsObjectLegalHoldEnabled(std::move(args));
+                    });
+}
+
+std::future<Result<ListBucketsResponse>> BaseClient::ListBucketsAsync(
+    ListBucketsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return ListBuckets(std::move(args));
+                    });
+}
+
+std::future<Result<ListBucketsResponse>> BaseClient::ListBucketsAsync() {
+  return std::async(std::launch::async, [this]() { return ListBuckets(); });
+}
+
+std::future<Result<ListenBucketNotificationResponse>>
+BaseClient::ListenBucketNotificationAsync(ListenBucketNotificationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return ListenBucketNotification(std::move(args));
+                    });
+}
+
+std::future<Result<ListObjectsResponse>> BaseClient::ListObjectsV1Async(
+    ListObjectsV1Args args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return ListObjectsV1(std::move(args));
+                    });
+}
+
+std::future<Result<ListObjectsResponse>> BaseClient::ListObjectsV2Async(
+    ListObjectsV2Args args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return ListObjectsV2(std::move(args));
+                    });
+}
+
+std::future<Result<ListObjectsResponse>> BaseClient::ListObjectVersionsAsync(
+    ListObjectVersionsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return ListObjectVersions(std::move(args));
+                    });
+}
+
+std::future<Result<MakeBucketResponse>> BaseClient::MakeBucketAsync(
+    MakeBucketArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return MakeBucket(std::move(args));
+                    });
+}
+
+std::future<Result<PutObjectResponse>> BaseClient::PutObjectAsync(
+    PutObjectApiArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return BaseClient::PutObject(std::move(args));
+                    });
+}
+
+std::future<Result<RemoveBucketResponse>> BaseClient::RemoveBucketAsync(
+    RemoveBucketArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return RemoveBucket(std::move(args));
+                    });
+}
+
+std::future<Result<RemoveObjectResponse>> BaseClient::RemoveObjectAsync(
+    RemoveObjectArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return RemoveObject(std::move(args));
+                    });
+}
+
+std::future<Result<RemoveObjectsResponse>> BaseClient::RemoveObjectsAsync(
+    RemoveObjectsApiArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return BaseClient::RemoveObjects(std::move(args));
+                    });
+}
+
+// SelectObjectContentArgs owns request by value (deep-copied via
+// SelectRequest's shared_ptr chain). Direct move is safe.
+std::future<Result<SelectObjectContentResponse>>
+BaseClient::SelectObjectContentAsync(SelectObjectContentArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SelectObjectContent(std::move(args));
+                    });
+}
+
+// SetBucketEncryptionArgs owns config by value.
+std::future<Result<SetBucketEncryptionResponse>>
+BaseClient::SetBucketEncryptionAsync(SetBucketEncryptionArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketEncryption(std::move(args));
+                    });
+}
+
+// SetBucketLifecycleArgs owns config by value.
+std::future<Result<SetBucketLifecycleResponse>>
+BaseClient::SetBucketLifecycleAsync(SetBucketLifecycleArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketLifecycle(std::move(args));
+                    });
+}
+
+// SetBucketNotificationArgs owns config by value.
+// config.
+std::future<Result<SetBucketNotificationResponse>>
+BaseClient::SetBucketNotificationAsync(SetBucketNotificationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketNotification(std::move(args));
+                    });
+}
+
+// SetBucketReplicationArgs owns config by value.
+std::future<Result<SetBucketReplicationResponse>>
+BaseClient::SetBucketReplicationAsync(SetBucketReplicationArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketReplication(std::move(args));
+                    });
+}
+
+std::future<Result<SetBucketPolicyResponse>> BaseClient::SetBucketPolicyAsync(
+    SetBucketPolicyArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketPolicy(std::move(args));
+                    });
+}
+
+std::future<Result<SetBucketTagsResponse>> BaseClient::SetBucketTagsAsync(
+    SetBucketTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketTags(std::move(args));
+                    });
+}
+
+std::future<Result<SetBucketVersioningResponse>>
+BaseClient::SetBucketVersioningAsync(SetBucketVersioningArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetBucketVersioning(std::move(args));
+                    });
+}
+
+std::future<Result<SetObjectLockConfigResponse>>
+BaseClient::SetObjectLockConfigAsync(SetObjectLockConfigArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetObjectLockConfig(std::move(args));
+                    });
+}
+
+std::future<Result<SetObjectRetentionResponse>>
+BaseClient::SetObjectRetentionAsync(SetObjectRetentionArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetObjectRetention(std::move(args));
+                    });
+}
+
+std::future<Result<SetObjectTagsResponse>> BaseClient::SetObjectTagsAsync(
+    SetObjectTagsArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return SetObjectTags(std::move(args));
+                    });
+}
+
+std::future<Result<StatObjectResponse>> BaseClient::StatObjectAsync(
+    StatObjectArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return StatObject(std::move(args));
+                    });
+}
+
+std::future<Result<UploadPartResponse>> BaseClient::UploadPartAsync(
+    UploadPartArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return UploadPart(std::move(args));
+                    });
+}
+
+std::future<Result<UploadPartCopyResponse>> BaseClient::UploadPartCopyAsync(
+    UploadPartCopyArgs args) {
+  return std::async(std::launch::async,
+                    [this, args = std::move(args)]() mutable {
+                      return UploadPartCopy(std::move(args));
+                    });
 }
 
 }  // namespace minio::s3

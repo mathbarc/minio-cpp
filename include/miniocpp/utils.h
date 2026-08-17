@@ -28,6 +28,7 @@
 #include <ios>
 #include <list>
 #include <map>
+#include <optional>
 #include <set>
 #include <streambuf>
 #include <string>
@@ -37,10 +38,11 @@
 
 namespace minio::utils {
 
-inline constexpr unsigned int kMaxMultipartCount = 10000;      // 10000 parts
-inline constexpr uint64_t kMaxObjectSize = 5'497'558'138'880;  // 5TiB
-inline constexpr uint64_t kMaxPartSize = 5'368'709'120;        // 5GiB
-inline constexpr unsigned int kMinPartSize = 5 * 1024 * 1024;  // 5MiB
+inline constexpr unsigned int kMaxMultipartCount = 10000;        // 10000 parts
+inline constexpr unsigned int kOptPartSize = 64 * 1024 * 1024;   // 64MiB
+inline constexpr unsigned int kMinPartSize = 5 * 1024 * 1024;    // 5MiB
+inline constexpr uint64_t kMaxPartSize = kMinPartSize * 1024;    // 5GiB
+inline constexpr uint64_t kMaxObjectSize = kMaxPartSize * 1024;  // 5TiB
 
 // GetEnv copies the environment variable name into var
 bool GetEnv(std::string& var, const char* name);
@@ -95,6 +97,9 @@ std::string Join(const std::vector<std::string>& values,
 // EncodePath does URL encoding of path. It also normalizes multiple slashes.
 std::string EncodePath(const std::string& path);
 
+// XMLEncode does XML encoding of value.
+std::string XMLEncode(const std::string& value);
+
 // Sha256hash computes SHA-256 of data and return hash as hex encoded value.
 std::string Sha256Hash(std::string_view str);
 
@@ -104,11 +109,21 @@ std::string Base64Encode(std::string_view str);
 // Md5sumHash computes MD5 of data and return hash as Base64 encoded value.
 std::string Md5sumHash(std::string_view str);
 
+// Crc64Nvme computes the NVM Express End-to-End Data Protection CRC-64
+// (polynomial 0xad93d23594c93659, reflected, init/xor 0xffffffffffffffff)
+// of `data`/`len` and returns the 8-byte raw value. Used to populate the
+// per-part `x-amz-checksum-crc64nvme` header on RDMA multipart uploads.
+uint64_t Crc64Nvme(const char* data, size_t len);
+
+// Crc64NvmeBase64 returns the Crc64Nvme of `data`/`len` encoded as the
+// 12-character base64 string the S3 RDMA UploadPart protocol expects.
+std::string Crc64NvmeBase64(const char* data, size_t len);
+
 error::Error CheckBucketName(std::string_view bucket_name, bool strict = false);
 error::Error ReadPart(std::istream& stream, char* buf, size_t size,
                       size_t& bytes_read);
-error::Error CalcPartInfo(long object_size, size_t& part_size,
-                          long& part_count);
+error::Error CalcPartInfo(std::optional<uint64_t> object_size,
+                          size_t& part_size, std::optional<size_t>& part_count);
 
 /**
  * UtcTime represents date and time in UTC timezone.

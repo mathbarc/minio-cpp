@@ -20,10 +20,14 @@
 
 #include <list>
 #include <map>
+#include <memory>
+#include <pugixml.hpp>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "error.h"
+#include "result.h"
 #include "types.h"
 #include "utils.h"
 
@@ -42,13 +46,9 @@ struct Response {
   std::string host_id;
   std::string bucket_name;
   std::string object_name;
+  std::string etag;
 
- private:
-  error::Error err_;
-
- public:
   Response();
-  explicit Response(error::Error err) : err_(std::move(err)) {}
 
   Response(const Response& resp) = default;
   Response& operator=(const Response& resp) = default;
@@ -58,30 +58,22 @@ struct Response {
 
   ~Response();
 
-  explicit operator bool() const {
-    return !err_ && code.empty() && message.empty() &&
-           (status_code == 0 || (status_code >= 200 && status_code <= 299));
-  }
-
-  error::Error Error() const;
-
-  static Response ParseXML(std::string_view data, int status_code,
-                           utils::Multimap headers);
+  static Result<Response> ParseXML(std::string_view data, int status_code,
+                                   utils::Multimap headers);
 };  // struct Response
 
-#define MINIO_S3_DERIVE_FROM_RESPONSE(DerivedName)                       \
-  struct DerivedName : public Response {                                 \
-    DerivedName() = default;                                             \
-    ~DerivedName() = default;                                            \
-                                                                         \
-    DerivedName(const DerivedName&) = default;                           \
-    DerivedName& operator=(const DerivedName&) = default;                \
-                                                                         \
-    DerivedName(DerivedName&&) = default;                                \
-    DerivedName& operator=(DerivedName&&) = default;                     \
-                                                                         \
-    explicit DerivedName(error::Error err) : Response(std::move(err)) {} \
-    explicit DerivedName(const Response& resp) : Response(resp) {}       \
+#define MINIO_S3_DERIVE_FROM_RESPONSE(DerivedName)                 \
+  struct DerivedName : public Response {                           \
+    DerivedName() = default;                                       \
+    ~DerivedName() = default;                                      \
+                                                                   \
+    DerivedName(const DerivedName&) = default;                     \
+    DerivedName& operator=(const DerivedName&) = default;          \
+                                                                   \
+    DerivedName(DerivedName&&) = default;                          \
+    DerivedName& operator=(DerivedName&&) = default;               \
+                                                                   \
+    explicit DerivedName(const Response& resp) : Response(resp) {} \
   };
 
 #define MINIO_S3_DERIVE_FROM_PUT_OBJECT_RESPONSE(DerivedName)               \
@@ -95,8 +87,6 @@ struct Response {
     DerivedName(DerivedName&&) = default;                                   \
     DerivedName& operator=(DerivedName&&) = default;                        \
                                                                             \
-    explicit DerivedName(error::Error err)                                  \
-        : PutObjectResponse(std::move(err)) {}                              \
     explicit DerivedName(const PutObjectResponse& resp)                     \
         : PutObjectResponse(resp) {}                                        \
     explicit DerivedName(const Response& resp) : PutObjectResponse(resp) {} \
@@ -109,8 +99,6 @@ struct GetRegionResponse : public Response {
   std::string region;
 
   explicit GetRegionResponse(std::string region) : region(std::move(region)) {}
-
-  explicit GetRegionResponse(error::Error err) : Response(std::move(err)) {}
 
   explicit GetRegionResponse(const Response& resp) : Response(resp) {}
 
@@ -125,21 +113,17 @@ struct ListBucketsResponse : public Response {
   explicit ListBucketsResponse(std::list<Bucket> buckets)
       : buckets(std::move(buckets)) {}
 
-  explicit ListBucketsResponse(error::Error err) : Response(std::move(err)) {}
-
   explicit ListBucketsResponse(const Response& resp) : Response(resp) {}
 
   ~ListBucketsResponse() = default;
 
-  static ListBucketsResponse ParseXML(std::string_view data);
+  static Result<ListBucketsResponse> ParseXML(std::string_view data);
 };  // struct ListBucketsResponse
 
 struct BucketExistsResponse : public Response {
   bool exist = false;
 
   explicit BucketExistsResponse(bool exist) : exist(exist) {}
-
-  explicit BucketExistsResponse(error::Error err) : Response(std::move(err)) {}
 
   explicit BucketExistsResponse(const Response& resp) : Response(resp) {}
 
@@ -153,19 +137,21 @@ struct CompleteMultipartUploadResponse : public Response {
   std::string location;
   std::string etag;
   std::string version_id;
+  std::string checksumCRC32;
+  std::string checksumCRC32C;
+  std::string checksumSHA1;
+  std::string checksumSHA256;
+  std::string checksum_crc64nvme;
 
   CompleteMultipartUploadResponse() = default;
-
-  explicit CompleteMultipartUploadResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit CompleteMultipartUploadResponse(const Response& resp)
       : Response(resp) {}
 
   ~CompleteMultipartUploadResponse() = default;
 
-  static CompleteMultipartUploadResponse ParseXML(std::string_view data,
-                                                  std::string version_id);
+  static Result<CompleteMultipartUploadResponse> ParseXML(
+      std::string_view data, std::string version_id);
 };  // struct CompleteMultipartUploadResponse
 
 struct CreateMultipartUploadResponse : public Response {
@@ -173,9 +159,6 @@ struct CreateMultipartUploadResponse : public Response {
 
   explicit CreateMultipartUploadResponse(std::string upload_id)
       : upload_id(std::move(upload_id)) {}
-
-  explicit CreateMultipartUploadResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit CreateMultipartUploadResponse(const Response& resp)
       : Response(resp) {}
@@ -186,10 +169,13 @@ struct CreateMultipartUploadResponse : public Response {
 struct PutObjectResponse : public Response {
   std::string etag;
   std::string version_id;
+  std::string checksumCRC32;
+  std::string checksumCRC32C;
+  std::string checksumSHA1;
+  std::string checksumSHA256;
+  std::string checksum_crc64nvme;
 
   PutObjectResponse() = default;
-
-  explicit PutObjectResponse(error::Error err) : Response(std::move(err)) {}
 
   explicit PutObjectResponse(const Response& resp) : Response(resp) {}
 
@@ -210,12 +196,10 @@ struct StatObjectResponse : public Response {
   RetentionMode retention_mode;
   utils::UtcTime retention_retain_until_date;
   LegalHold legal_hold;
-  bool delete_marker;
+  bool delete_marker = false;
   utils::Multimap user_metadata;
 
   StatObjectResponse() = default;
-
-  explicit StatObjectResponse(error::Error err) : Response(std::move(err)) {}
 
   explicit StatObjectResponse(const Response& resp) : Response(resp) {}
 
@@ -227,23 +211,23 @@ MINIO_S3_DERIVE_FROM_RESPONSE(DownloadObjectResponse)
 MINIO_S3_DERIVE_FROM_RESPONSE(GetObjectResponse)
 
 struct Item : public Response {
-  std::string etag;  // except DeleteMarker
-  std::string name;
+  // etag and name stored in owning ListObjectsResponse's owned_.
+  std::string_view etag;  // except DeleteMarker
+  std::string_view name;
   utils::UtcTime last_modified;
-  std::string owner_id;
-  std::string owner_name;
+  // Fields below point into owning ListObjectsResponse's xml_document memory.
+  std::string_view owner_id;
+  std::string_view owner_name;
   size_t size = 0;  // except DeleteMarker
-  std::string storage_class;
-  bool is_latest = false;  // except ListObjects V1/V2
-  std::string version_id;  // except ListObjects V1/V2
+  std::string_view storage_class;
+  bool is_latest = false;       // except ListObjects V1/V2
+  std::string_view version_id;  // except ListObjects V1/V2
   std::map<std::string, std::string> user_metadata;
   bool is_prefix = false;
   bool is_delete_marker = false;
-  std::string encoding_type;
+  std::string_view encoding_type;
 
   Item() = default;
-
-  explicit Item(error::Error err) : Response(std::move(err)) {}
 
   explicit Item(const Response& resp) : Response(resp) {}
 
@@ -252,39 +236,45 @@ struct Item : public Response {
 
 struct ListObjectsResponse : public Response {
   // Common
-  std::string name;
-  std::string encoding_type;
-  std::string prefix;
-  std::string delimiter;
+  std::string_view name;
+  std::string_view encoding_type;
+  std::string_view prefix;
+  std::string_view delimiter;
   bool is_truncated;
   unsigned int max_keys;
   std::list<Item> contents;
 
+  // Owned XML document for zero-copy string_view backing.
+  std::shared_ptr<pugi::xml_document> doc_;
+  // Owned strings for non-XML-assigned string_view backing storage.
+  std::list<std::string> owned_;
+
   // ListObjectsV1
-  std::string marker;
-  std::string next_marker;
+  std::string_view marker;
+  std::string_view next_marker;
 
   // ListObjectsV2
   unsigned int key_count;
-  std::string start_after;
-  std::string continuation_token;
-  std::string next_continuation_token;
+  std::string_view start_after;
+  std::string_view continuation_token;
+  std::string_view next_continuation_token;
 
   // ListObjectVersions
-  std::string key_marker;
-  std::string next_key_marker;
-  std::string version_id_marker;
-  std::string next_version_id_marker;
+  std::string_view key_marker;
+  std::string_view next_key_marker;
+  std::string_view version_id_marker;
+  std::string_view next_version_id_marker;
 
   ListObjectsResponse() = default;
-
-  explicit ListObjectsResponse(error::Error err) : Response(std::move(err)) {}
+  ListObjectsResponse(const ListObjectsResponse&) = delete;
+  ListObjectsResponse& operator=(const ListObjectsResponse&) = delete;
+  ListObjectsResponse(ListObjectsResponse&&) = default;
+  ListObjectsResponse& operator=(ListObjectsResponse&&) = default;
 
   explicit ListObjectsResponse(const Response& resp) : Response(resp) {}
 
-  ~ListObjectsResponse() = default;
-
-  static ListObjectsResponse ParseXML(std::string_view data, bool version);
+  static Result<ListObjectsResponse> ParseXML(std::string_view data,
+                                              bool version);
 };  // struct ListObjectsResponse
 
 MINIO_S3_DERIVE_FROM_PUT_OBJECT_RESPONSE(CopyObjectResponse)
@@ -294,7 +284,7 @@ MINIO_S3_DERIVE_FROM_PUT_OBJECT_RESPONSE(UploadObjectResponse)
 struct DeletedObject : public Response {
   std::string name;
   std::string version_id;
-  bool delete_marker;
+  bool delete_marker = false;
   std::string delete_marker_version_id;
 
   DeletedObject() = default;
@@ -305,8 +295,6 @@ struct DeleteError : public Response {
   std::string version_id;
 
   DeleteError() = default;
-
-  explicit DeleteError(error::Error err) : Response(std::move(err)) {}
 
   explicit DeleteError(const Response& resp) : Response(resp) {}
 
@@ -319,13 +307,11 @@ struct RemoveObjectsResponse : public Response {
 
   RemoveObjectsResponse() = default;
 
-  explicit RemoveObjectsResponse(error::Error err) : Response(std::move(err)) {}
-
   explicit RemoveObjectsResponse(const Response& resp) : Response(resp) {}
 
   ~RemoveObjectsResponse() = default;
 
-  static RemoveObjectsResponse ParseXML(std::string_view data);
+  static Result<RemoveObjectsResponse> ParseXML(std::string_view data);
 };  // struct RemoveObjectsResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SelectObjectContentResponse)
@@ -337,9 +323,6 @@ struct GetBucketPolicyResponse : public Response {
 
   explicit GetBucketPolicyResponse(std::string policy)
       : policy(std::move(policy)) {}
-
-  explicit GetBucketPolicyResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit GetBucketPolicyResponse(const Response& resp) : Response(resp) {}
 
@@ -355,15 +338,12 @@ struct GetBucketNotificationResponse : public Response {
   explicit GetBucketNotificationResponse(NotificationConfig config)
       : config(std::move(config)) {}
 
-  explicit GetBucketNotificationResponse(error::Error err)
-      : Response(std::move(err)) {}
-
   explicit GetBucketNotificationResponse(const Response& resp)
       : Response(resp) {}
 
   ~GetBucketNotificationResponse() = default;
 
-  static GetBucketNotificationResponse ParseXML(std::string_view data);
+  static Result<GetBucketNotificationResponse> ParseXML(std::string_view data);
 };  // struct GetBucketNotificationResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetBucketNotificationResponse)
@@ -375,14 +355,11 @@ struct GetBucketEncryptionResponse : public Response {
   explicit GetBucketEncryptionResponse(SseConfig config)
       : config(std::move(config)) {}
 
-  explicit GetBucketEncryptionResponse(error::Error err)
-      : Response(std::move(err)) {}
-
   explicit GetBucketEncryptionResponse(const Response& resp) : Response(resp) {}
 
   ~GetBucketEncryptionResponse() = default;
 
-  static GetBucketEncryptionResponse ParseXML(std::string_view data);
+  static Result<GetBucketEncryptionResponse> ParseXML(std::string_view data);
 };  // struct GetBucketEncryptionResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetBucketEncryptionResponse)
@@ -392,9 +369,6 @@ struct GetBucketVersioningResponse : public Response {
   Boolean mfa_delete;
 
   GetBucketVersioningResponse() = default;
-
-  explicit GetBucketVersioningResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit GetBucketVersioningResponse(const Response& resp) : Response(resp) {}
 
@@ -422,15 +396,12 @@ struct GetBucketReplicationResponse : public Response {
   explicit GetBucketReplicationResponse(ReplicationConfig config)
       : config(std::move(config)) {}
 
-  explicit GetBucketReplicationResponse(error::Error err)
-      : Response(std::move(err)) {}
-
   explicit GetBucketReplicationResponse(const Response& resp)
       : Response(resp) {}
 
   ~GetBucketReplicationResponse() = default;
 
-  static GetBucketReplicationResponse ParseXML(std::string_view data);
+  static Result<GetBucketReplicationResponse> ParseXML(std::string_view data);
 };  // struct GetBucketReplicationResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetBucketReplicationResponse)
@@ -442,12 +413,9 @@ struct GetBucketLifecycleResponse : public Response {
   explicit GetBucketLifecycleResponse(LifecycleConfig config)
       : config(std::move(config)) {}
 
-  explicit GetBucketLifecycleResponse(error::Error err)
-      : Response(std::move(err)) {}
-
   explicit GetBucketLifecycleResponse(const Response& resp) : Response(resp) {}
 
-  static GetBucketLifecycleResponse ParseXML(std::string_view data);
+  static Result<GetBucketLifecycleResponse> ParseXML(std::string_view data);
 };  // struct GetBucketLifecycleResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetBucketLifecycleResponse)
@@ -459,13 +427,11 @@ struct GetBucketTagsResponse : public Response {
   GetBucketTagsResponse(std::map<std::string, std::string> tags)
       : tags(std::move(tags)) {}
 
-  explicit GetBucketTagsResponse(error::Error err) : Response(std::move(err)) {}
-
   explicit GetBucketTagsResponse(const Response& resp) : Response(resp) {}
 
   ~GetBucketTagsResponse() = default;
 
-  static GetBucketTagsResponse ParseXML(std::string_view data);
+  static Result<GetBucketTagsResponse> ParseXML(std::string_view data);
 };  // struct GetBucketTagsResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetBucketTagsResponse)
@@ -476,9 +442,6 @@ struct GetObjectLockConfigResponse : public Response {
 
   explicit GetObjectLockConfigResponse(ObjectLockConfig config)
       : config(std::move(config)) {}
-
-  explicit GetObjectLockConfigResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit GetObjectLockConfigResponse(const Response& resp) : Response(resp) {}
 
@@ -494,13 +457,11 @@ struct GetObjectTagsResponse : public Response {
   GetObjectTagsResponse(std::map<std::string, std::string> tags)
       : tags(std::move(tags)) {}
 
-  explicit GetObjectTagsResponse(error::Error err) : Response(std::move(err)) {}
-
   explicit GetObjectTagsResponse(const Response& resp) : Response(resp) {}
 
   ~GetObjectTagsResponse() = default;
 
-  static GetObjectTagsResponse ParseXML(std::string_view data);
+  static Result<GetObjectTagsResponse> ParseXML(std::string_view data);
 };  // struct GetObjectTagsResponse
 
 MINIO_S3_DERIVE_FROM_RESPONSE(SetObjectTagsResponse)
@@ -511,9 +472,6 @@ struct IsObjectLegalHoldEnabledResponse : public Response {
   bool enabled = false;
 
   explicit IsObjectLegalHoldEnabledResponse(bool enabled) : enabled(enabled) {}
-
-  explicit IsObjectLegalHoldEnabledResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit IsObjectLegalHoldEnabledResponse(const Response& resp)
       : Response(resp) {}
@@ -526,9 +484,6 @@ struct GetObjectRetentionResponse : public Response {
   utils::UtcTime retain_until_date;
 
   GetObjectRetentionResponse() = default;
-
-  explicit GetObjectRetentionResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit GetObjectRetentionResponse(const Response& resp) : Response(resp) {}
 
@@ -543,9 +498,6 @@ struct GetPresignedObjectUrlResponse : public Response {
   explicit GetPresignedObjectUrlResponse(std::string url)
       : url(std::move(url)) {}
 
-  explicit GetPresignedObjectUrlResponse(error::Error err)
-      : Response(std::move(err)) {}
-
   explicit GetPresignedObjectUrlResponse(const Response& resp)
       : Response(resp) {}
 
@@ -557,9 +509,6 @@ struct GetPresignedPostFormDataResponse : public Response {
 
   GetPresignedPostFormDataResponse(std::map<std::string, std::string> form_data)
       : form_data(std::move(form_data)) {}
-
-  explicit GetPresignedPostFormDataResponse(error::Error err)
-      : Response(std::move(err)) {}
 
   explicit GetPresignedPostFormDataResponse(const Response& resp)
       : Response(resp) {}
